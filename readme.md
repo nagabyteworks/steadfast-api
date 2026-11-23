@@ -5,7 +5,7 @@ To run the backend API server, navigate to the steadfast-api directory and use t
 ```bash
 cd steadfast-api
 npm install
-node server.js
+NODE_ENV=development node server.js
 ```
 
 The application will be available at http://localhost:3000.

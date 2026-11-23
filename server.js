@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+require("dotenv").config();
 const config = require("./config");
 const net = require("net");
 
@@ -8,16 +9,25 @@ const flattradeRoutes = require("./routes/flattrade");
 const shoonyaRoutes = require("./routes/shoonya");
 const virtualRoutes = require("./routes/virtual");
 const fileUpdates = require('./routes/fileUpdates');
+const requireAllowedOrigin = require("./middleware/requireAllowedOrigin");
 
 const app = express();
 
+if (!config.internalToken) {
+  console.warn("WebSocket credential access is unprotected in development; keep the API private.");
+}
 app.use(cors(config.corsHeaders));
+if (config.environment === "production") {
+  app.use((req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+  });
+  app.use(requireAllowedOrigin(config.corsHeaders.origin));
+}
 
 app.use(express.json());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-
-require("dotenv").config();
 
 let storedCredentials = {
   flattrade: { usersession: "", userid: "" },
@@ -28,28 +38,54 @@ let selectedBroker = "";
 const pythonServerPort = 5000; // Choose an available port
 
 app.set("case sensitive routing", false);
-app.use("/flattrade", flattradeRoutes(storedCredentials));
-app.use("/shoonya", shoonyaRoutes(storedCredentials));
-app.use("/virtual", virtualRoutes());
+app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, async () => {
+  if (config.environment === "production" || selectedBroker === "flattrade") {
+    await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
+  }
+}));
+if (config.environment === "production") {
+  app.use("/shoonya", (req, res) => {
+    res.status(503).json({ message: "Shoonya is unavailable in production until server-managed sessions are implemented" });
+  });
+} else {
+  app.use("/shoonya", shoonyaRoutes(storedCredentials, config.internalToken));
+}
+if (config.environment === "production") {
+  app.use("/virtual", (req, res) => {
+    res.status(403).json({ message: "Virtual trading is unavailable in production" });
+  });
+} else {
+  app.use("/virtual", virtualRoutes());
+}
 
 app.get("/", (req, res) => res.send("Welcome to the Steadfast API"));
 
-const BROKER_PORTS = {
-  flattrade: 8765,
-  shoonya: 8766,
-};
+const BROKER_PORTS = config.brokerPorts;
 
 function sendToPythonServer(message) {
   return new Promise((resolve, reject) => {
     const client = new net.Socket();
-    client.connect(pythonServerPort, "localhost", () => {
+    let response = "";
+    client.setTimeout(5000, () => client.destroy(new Error("Broker selector timed out")));
+    client.connect(pythonServerPort, "127.0.0.1", () => {
       client.write(JSON.stringify(message));
     });
 
     client.on("data", (data) => {
-      console.log("Received:", data.toString());
-      client.destroy();
-      resolve(data.toString());
+      response += data.toString();
+    });
+
+    client.on("end", () => {
+      try {
+        const result = JSON.parse(response);
+        if (result.status !== "success") {
+          reject(new Error("Broker selector rejected the request"));
+        } else {
+          resolve(result);
+        }
+      } catch {
+        reject(new Error("Invalid response from broker selector"));
+      }
     });
 
     client.on("close", () => {
@@ -65,16 +101,15 @@ function sendToPythonServer(message) {
 
 app.post("/set-broker", async (req, res) => {
   const { broker } = req.body;
-  if (broker && (broker === "flattrade" || broker === "shoonya")) {
-    selectedBroker = broker;
-
+  if (broker === "flattrade" || (config.environment !== "production" && broker === "shoonya")) {
     try {
       // Send the broker selection to the Python server
       await sendToPythonServer({
         action: "set_broker",
-        broker: selectedBroker,
+        broker,
       });
 
+      selectedBroker = broker;
       const port = BROKER_PORTS[broker];
       res.json({
         message: `Selected broker set to ${selectedBroker}, WebSocket running on port ${port}`,
@@ -89,12 +124,8 @@ app.post("/set-broker", async (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error("Error details:", err);
-  console.error("Stack trace:", err.stack);
-  res.status(500).json({
-    message: "An error occurred on the server",
-    error: err.message,
-  });
+  console.error("Unhandled request error", { name: err.name });
+  res.status(500).json({ message: "An error occurred on the server" });
 });
 
 app.listen(config.port, config.host, () => {

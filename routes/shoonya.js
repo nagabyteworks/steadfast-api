@@ -9,12 +9,15 @@ const path = require("path");
 const qs = require("qs");
 const { parse, isBefore } = require("date-fns");
 const unzipper = require("unzipper");
+const requireTradingEnabled = require("../middleware/requireTradingEnabled");
+const requireInternalToken = require("../middleware/requireInternalToken");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 
-module.exports = (storedCredentials) => {
+module.exports = (storedCredentials, internalToken) => {
   router.use(
     "/shoonyaApi",
+    requireTradingEnabled,
     createProxyMiddleware({
       target: "https://api.shoonya.com",
       changeOrigin: true,
@@ -26,7 +29,6 @@ module.exports = (storedCredentials) => {
 
   router.post("/login", async (req, res) => {
     console.log("Received Shoonya login request");
-    console.log("Request body:", req.body);
     try {
       if (!req.body || Object.keys(req.body).length === 0) {
         throw new Error("Empty request body");
@@ -49,11 +51,9 @@ module.exports = (storedCredentials) => {
           },
         }
       );
-      console.log("Shoonya API response:", response.data);
       res.json(response.data);
     } catch (error) {
       console.error("Error in Shoonya login:", error.message);
-      console.error("Full error object:", error);
       res
         .status(400)
         .json({ message: "Error logging in to Shoonya", error: error.message });
@@ -80,7 +80,7 @@ module.exports = (storedCredentials) => {
   });
 
   // ===> Endpoint to retrieve Shoonya websocket data
-  router.get("/websocketData", (req, res) => {
+  router.get("/websocketData", requireInternalToken(internalToken), (req, res) => {
     // console.log("Received GET request for Shoonya websocket data");
 
     // Use the stored Shoonya credentials and security IDs
@@ -89,7 +89,7 @@ module.exports = (storedCredentials) => {
       userid: storedCredentials.shoonya.userid,
     };
 
-    res.json(websocketData);
+    res.set("Cache-Control", "no-store").json(websocketData);
     console.log("Sending Shoonya websocket data:");
   });
 
@@ -125,7 +125,7 @@ module.exports = (storedCredentials) => {
         message: "Error fetching Shoonya fund limits",
         error: error.message,
       });
-      console.error("Error fetching Shoonya fund limits:", error);
+      console.error("Error fetching Shoonya fund limits:", error.message);
     }
   });
 
@@ -296,7 +296,7 @@ module.exports = (storedCredentials) => {
         message: "Error fetching Shoonya orders and trades",
         error: error.message,
       });
-      console.error("Error fetching Shoonya orders and trades:", error);
+      console.error("Error fetching Shoonya orders and trades:", error.message);
     }
   });
 
@@ -330,14 +330,14 @@ module.exports = (storedCredentials) => {
         message: "Error getting Shoonya option Greek",
         error: error.message,
       });
-      console.error("Error getting Shoonya option Greek:", error);
+      console.error("Error getting Shoonya option Greek:", error.message);
     }
   });
 
   // ===> TRADING API CALLS <===
 
   // ===> Place Shoonya Order
-  router.post("/placeOrder", async (req, res) => {
+  router.post("/placeOrder", requireTradingEnabled, async (req, res) => {
     const jKey = req.headers.authorization?.split(" ")[1];
 
     if (!jKey) {
@@ -362,22 +362,17 @@ module.exports = (storedCredentials) => {
         }
       );
       res.json(response.data);
-      console.log(
-        `\nShoonya Order Place details:`,
-        jData,
-        response.data
-      );
     } catch (error) {
       res.status(500).json({
         message: "Error placing Shoonya Place order",
         error: error.message,
       });
-      console.error("Error placing Shoonya Place order:", error);
+      console.error("Error placing Shoonya Place order:", error.message);
     }
   });
 
   // ===> Cancel Shoonya Order
-  router.post("/cancelOrder", async (req, res) => {
+  router.post("/cancelOrder", requireTradingEnabled, async (req, res) => {
     const { norenordno, uid } = req.body;
     const jKey = req.query.SHOONYA_API_TOKEN;
 
@@ -401,13 +396,12 @@ module.exports = (storedCredentials) => {
         }
       );
       res.json(response.data);
-      console.log(`\n Shoonya Cancel Order:`, { norenordno }, response.data);
     } catch (error) {
       res.status(500).json({
         message: "Error cancelling Shoonya order",
         error: error.message,
       });
-      console.error("Error cancelling Shoonya order:", error);
+      console.error("Error cancelling Shoonya order:", error.message);
     }
   });
 

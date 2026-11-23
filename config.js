@@ -1,33 +1,63 @@
-const config = {
-  development: {
-    port: 3000,
-    host: "localhost",
-    corsOrigin: "http://localhost:5173",
+const environment = process.env.NODE_ENV;
+
+if (!["development", "production"].includes(environment)) {
+  throw new Error("NODE_ENV must be development or production");
+}
+
+function readPort(name, defaultPort) {
+  const port = Number(process.env[name] || defaultPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`${name} must be an integer between 1 and 65535`);
+  }
+  return port;
+}
+
+const corsOrigin = process.env.CORS_ORIGIN ||
+  (environment === "development" ? "http://localhost:5173" : "");
+
+if (!corsOrigin) {
+  throw new Error("CORS_ORIGIN is required in production");
+}
+
+const internalToken = process.env.WEBSOCKET_INTERNAL_TOKEN || "";
+if (environment === "production" && !internalToken) {
+  throw new Error("WEBSOCKET_INTERNAL_TOKEN is required in production");
+}
+if (internalToken && !/^[A-Za-z0-9_-]{32,256}$/.test(internalToken)) {
+  throw new Error("WEBSOCKET_INTERNAL_TOKEN must be 32-256 URL-safe characters");
+}
+
+let parsedOrigin;
+try {
+  parsedOrigin = new URL(corsOrigin);
+} catch {
+  throw new Error("CORS_ORIGIN must be an absolute origin");
+}
+if (
+  parsedOrigin.origin !== corsOrigin ||
+  !["http:", "https:"].includes(parsedOrigin.protocol) ||
+  (environment === "production" && parsedOrigin.protocol !== "https:")
+) {
+  throw new Error("CORS_ORIGIN must be an HTTPS origin in production");
+}
+
+const host = process.env.API_HOST || "127.0.0.1";
+if (environment === "production" && !["127.0.0.1", "::1", "localhost"].includes(host)) {
+  throw new Error("API_HOST must be loopback in production");
+}
+
+module.exports = {
+  environment,
+  internalToken,
+  port: readPort("PORT", 3000),
+  host,
+  brokerPorts: {
+    flattrade: readPort("FLATTRADE_WS_PORT", 8765),
+    shoonya: readPort("SHOONYA_WS_PORT", 8766),
   },
-  production: {
-    port: process.env.PORT || 3000,
-    host: "0.0.0.0",
-    corsOrigin: [
-      "https://steadfastapp.in",
-      "https://www.steadfastapp.in",
-      "https://api.steadfastapp.in",
-    ],
+  corsHeaders: {
+    origin: corsOrigin,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   },
 };
-
-const environment = process.env.NODE_ENV || "development";
-const currentConfig = config[environment];
-
-// Ensure corsOrigin is always an array
-currentConfig.corsOrigin = Array.isArray(currentConfig.corsOrigin)
-  ? currentConfig.corsOrigin
-  : [currentConfig.corsOrigin];
-
-// Add 'Access-Control-Allow-Origin' header to the response
-currentConfig.corsHeaders = {
-  "Access-Control-Allow-Origin": currentConfig.corsOrigin,
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
-
-module.exports = currentConfig;

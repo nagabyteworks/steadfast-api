@@ -1,5 +1,4 @@
 const express = require("express");
-const router = express.Router();
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const axios = require("axios");
 const NodeCache = require("node-cache");
@@ -7,12 +6,36 @@ const fs = require("fs");
 const csv = require("fast-csv");
 const qs = require("qs");
 const { parse, isBefore } = require("date-fns");
+const { createHash } = require("crypto");
+const requireTradingEnabled = require("../middleware/requireTradingEnabled");
+const requireInternalToken = require("../middleware/requireInternalToken");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 
-module.exports = (storedCredentials) => {
+module.exports = (storedCredentials, internalToken, onSessionUpdated = async () => {}) => {
+  const router = express.Router();
+  const production = process.env.NODE_ENV === "production";
+  let loginInProgress = false;
+
+  const getSession = (req) => production
+    ? storedCredentials.flattrade
+    : {
+        usersession: req.query.FLATTRADE_API_TOKEN || req.headers.authorization?.split(" ")[1],
+        userid: req.query.FLATTRADE_CLIENT_ID,
+      };
+
+  const configuredAccount = () => ({
+    apiKey: process.env.FLATTRADE_API_KEY,
+    apiSecret: process.env.FLATTRADE_API_SECRET,
+    clientId: process.env.FLATTRADE_CLIENT_ID,
+  });
+
   router.use(
     "/flattradeApi",
+    (req, res, next) => production
+      ? res.status(403).json({ message: "Raw broker proxy is disabled in production" })
+      : next(),
+    requireTradingEnabled,
     createProxyMiddleware({
       target: "https://authapi.flattrade.in",
       changeOrigin: true,
@@ -23,7 +46,53 @@ module.exports = (storedCredentials) => {
   );
   router.post("/generateToken", async (req, res) => {
     console.log("Received generateToken request");
-    console.log("Request body:", req.body);
+    if (production) {
+      const { apiKey, apiSecret, clientId } = configuredAccount();
+      const requestCode = req.body?.request_code;
+      if (!apiKey || !apiSecret || !clientId) {
+        return res.status(503).json({ message: "Flattrade account is not configured on the server" });
+      }
+      if (typeof requestCode !== "string" || !requestCode || requestCode.length > 1024) {
+        return res.status(400).json({ message: "Invalid Flattrade request code" });
+      }
+      if (loginInProgress) {
+        return res.status(409).json({ message: "A Flattrade session exchange is already in progress" });
+      }
+      loginInProgress = true;
+      storedCredentials.flattrade = { usersession: "", userid: "" };
+      try {
+        const apiSecretHash = createHash("sha256")
+          .update(apiKey + requestCode + apiSecret)
+          .digest("hex");
+        const response = await axios.post("https://authapi.flattrade.in/trade/apitoken", {
+          api_key: apiKey,
+          request_code: requestCode,
+          api_secret: apiSecretHash,
+        }, { headers: { "Content-Type": "application/json" }, timeout: 10000 });
+        const status = response.data?.status ?? response.data?.stat;
+        if (
+          typeof status !== "string" || status.toLowerCase() !== "ok" ||
+          typeof response.data?.token !== "string" || !response.data.token ||
+          typeof response.data?.client !== "string" ||
+          response.data.client.toUpperCase() !== clientId.toUpperCase()
+        ) {
+          return res.status(502).json({ message: "Flattrade did not issue a session for the configured account" });
+        }
+        storedCredentials.flattrade = { usersession: response.data.token, userid: clientId };
+        try {
+          await onSessionUpdated();
+        } catch (error) {
+          console.error("Unable to restart Flattrade streaming after session exchange:", error.message);
+          return res.status(503).json({ message: "Flattrade session created, but the streaming service could not be restarted" });
+        }
+        return res.set("Cache-Control", "no-store").json({ connected: true });
+      } catch (error) {
+        console.error("Flattrade session exchange failed", { code: error.code, status: error.response?.status });
+        return res.status(502).json({ message: "Flattrade session exchange failed" });
+      } finally {
+        loginInProgress = false;
+      }
+    }
     try {
       if (!req.body || Object.keys(req.body).length === 0) {
         throw new Error("Empty request body");
@@ -38,15 +107,32 @@ module.exports = (storedCredentials) => {
           },
         }
       );
-      console.log("Flattrade API response:", response.data);
       res.json(response.data);
     } catch (error) {
       console.error("Error in generateToken:", error.message);
-      console.error("Full error object:", error);
       res
         .status(400)
         .json({ message: "Error generating token", error: error.message });
     }
+  });
+  router.get("/account", (req, res) => {
+    if (!production) {
+      return res.status(404).json({ message: "Server-managed account is only available in production" });
+    }
+    const { apiKey, apiSecret, clientId } = configuredAccount();
+    const configured = Boolean(apiKey && apiSecret && clientId);
+    res.set("Cache-Control", "no-store").json({
+      configured,
+      clientId: configured ? clientId : null,
+      hasSession: Boolean(storedCredentials.flattrade.usersession),
+    });
+  });
+  router.get("/auth", (req, res) => {
+    const { apiKey, apiSecret, clientId } = configuredAccount();
+    if (!production || !apiKey || !apiSecret || !clientId) {
+      return res.status(503).json({ message: "Flattrade account is not configured on the server" });
+    }
+    res.set("Cache-Control", "no-store").redirect(`https://auth.flattrade.in/?app_key=${encodeURIComponent(apiKey)}`);
   });
   router.get("/test", (req, res) => {
     console.log("Test route accessed");
@@ -62,6 +148,9 @@ module.exports = (storedCredentials) => {
 
   // ===> Endpoint to store the credentials
   router.post("/setCredentials", (req, res) => {
+    if (production) {
+      return res.status(403).json({ message: "Browser-provided broker credentials are disabled in production" });
+    }
     console.log("Received POST request to set credentials");
     const { usersession, userid } = req.body;
 
@@ -78,7 +167,7 @@ module.exports = (storedCredentials) => {
   });
 
   // ===> Endpoint to use the stored credentials
-  router.get("/websocketData", (req, res) => {
+  router.get("/websocketData", requireInternalToken(internalToken), (req, res) => {
     // console.log("Received GET request for flattrade websocket data");
 
     // Use the stored credentials
@@ -87,7 +176,7 @@ module.exports = (storedCredentials) => {
       userid: storedCredentials.flattrade.userid,
     };
 
-    res.json(websocketData);
+    res.set("Cache-Control", "no-store").json(websocketData);
     console.log(
       `${new Date().toLocaleTimeString()}  Sending Flattrade websocket data`
     );
@@ -95,8 +184,7 @@ module.exports = (storedCredentials) => {
 
   // ===> Get Flattrade Funds
   router.post("/fundLimit", async (req, res) => {
-    const jKey = req.query.FLATTRADE_API_TOKEN;
-    const clientId = req.query.FLATTRADE_CLIENT_ID;
+    const { usersession: jKey, userid: clientId } = getSession(req);
 
     if (!jKey || !clientId) {
       return res
@@ -112,9 +200,10 @@ module.exports = (storedCredentials) => {
 
     try {
       const response = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/Limits",
+        "https://piconnect.flattrade.in/PiConnectAPI/Limits",
         payload,
         {
+          timeout: 10000,
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
           },
@@ -122,11 +211,27 @@ module.exports = (storedCredentials) => {
       );
       res.json(response.data);
     } catch (error) {
-      res.status(500).json({
-        message: "Error fetching Flattrade fund limits",
-        error: error.message,
-      });
-      console.error("Error fetching Flattrade fund limits:", error);
+      console.error("Error fetching Flattrade fund limits", { code: error.code, status: error.response?.status });
+      res.status(502).json({ message: "Error fetching Flattrade fund limits" });
+    }
+  });
+
+  router.get("/positions", async (req, res) => {
+    const { usersession, userid } = getSession(req);
+    if (!usersession || !userid) {
+      return res.status(401).json({ message: "Flattrade session is unavailable" });
+    }
+    try {
+      const payload = `jKey=${usersession}&jData=${JSON.stringify({ uid: userid, actid: userid })}`;
+      const response = await axios.post(
+        "https://piconnect.flattrade.in/PiConnectAPI/PositionBook",
+        payload,
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
+      );
+      res.json(response.data);
+    } catch (error) {
+      console.error("Error fetching Flattrade positions", { code: error.code, status: error.response?.status });
+      res.status(502).json({ message: "Error fetching Flattrade positions" });
     }
   });
 
@@ -213,8 +318,7 @@ module.exports = (storedCredentials) => {
 
   // ===> Get Flattrade Orders and Trades
   router.get("/getOrdersAndTrades", async (req, res) => {
-    const jKey = req.query.FLATTRADE_API_TOKEN;
-    const clientId = req.query.FLATTRADE_CLIENT_ID;
+    const { usersession: jKey, userid: clientId } = getSession(req);
 
     if (!jKey || !clientId) {
       return res
@@ -234,9 +338,10 @@ module.exports = (storedCredentials) => {
     try {
       // Fetch Order Book
       const orderBookRes = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/OrderBook",
+        "https://piconnect.flattrade.in/PiConnectAPI/OrderBook",
         orderBookPayload,
         {
+          timeout: 10000,
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
           },
@@ -245,9 +350,10 @@ module.exports = (storedCredentials) => {
 
       // Fetch Trade Book
       const tradeBookRes = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/TradeBook",
+        "https://piconnect.flattrade.in/PiConnectAPI/TradeBook",
         tradeBookPayload,
         {
+          timeout: 10000,
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
           },
@@ -259,17 +365,14 @@ module.exports = (storedCredentials) => {
         tradeBook: tradeBookRes.data,
       });
     } catch (error) {
-      res.status(500).json({
-        message: "Error fetching Flattrade orders and trades",
-        error: error.message,
-      });
-      console.error("Error fetching Flattrade orders and trades:", error);
+      console.error("Error fetching Flattrade orders and trades", { code: error.code, status: error.response?.status });
+      res.status(502).json({ message: "Error fetching Flattrade orders and trades" });
     }
   });
 
   // ===> Get Flattrade Option Greek
   router.post("/getOptionGreek", async (req, res) => {
-    const jKey = req.headers.authorization?.split(" ")[1];
+    const { usersession: jKey } = getSession(req);
     const { jData } = req.body;
 
     if (!jKey) {
@@ -282,7 +385,7 @@ module.exports = (storedCredentials) => {
 
     try {
       const response = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/GetOptionGreek",
+        "https://piconnect.flattrade.in/PiConnectAPI/GetOptionGreek",
         payload,
         {
           headers: {
@@ -291,21 +394,17 @@ module.exports = (storedCredentials) => {
         }
       );
       res.json(response.data);
-      console.log(`\nFlattrade Get Option Greek details:`, response.data);
     } catch (error) {
-      res.status(500).json({
-        message: "Error getting Flattrade option Greek",
-        error: error.message,
-      });
-      console.error("Error getting Flattrade option Greek:", error);
+      console.error("Error getting Flattrade option Greek", { code: error.code, status: error.response?.status });
+      res.status(502).json({ message: "Error getting Flattrade option Greek" });
     }
   });
 
   //===> TRADING API CALLS <===
 
   // ===> Place Flattrade Order
-  router.post("/placeOrder", async (req, res) => {
-    const jKey = req.headers.authorization?.split(" ")[1];
+  router.post("/placeOrder", requireTradingEnabled, async (req, res) => {
+    const { usersession: jKey } = getSession(req);
 
     if (!jKey) {
       return res
@@ -313,14 +412,18 @@ module.exports = (storedCredentials) => {
         .json({ message: "Token is missing. Please generate a token first." });
     }
 
-    const jData = qs.parse(req.body);
+    const jData = typeof req.body === "string" ? qs.parse(req.body) : req.body;
+    if (production) {
+      jData.uid = storedCredentials.flattrade.userid;
+      jData.actid = storedCredentials.flattrade.userid;
+    }
 
     // const payload = `jKey=${jKey}&jData=${encodeURIComponent(jData)}`; // Not sure if we need this version, so keep it.
     const payload = `jKey=${jKey}&jData=${JSON.stringify(jData)}`;
 
     try {
       const response = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/PlaceOrder",
+        "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder",
         payload,
         {
           headers: {
@@ -329,24 +432,21 @@ module.exports = (storedCredentials) => {
         }
       );
       res.json(response.data);
-      console.log(
-        `\nFlattrade Order Place details:`,
-        jData,
-        response.data
-      );
     } catch (error) {
       res.status(500).json({
         message: "Error placing Flattrade Place order",
         error: error.message,
       });
-      console.error("Error placing Flattrade Place order:", error);
+      console.error("Error placing Flattrade Place order:", error.message);
     }
   });
 
   // ===> Cancel Flattrade Order
-  router.post("/cancelOrder", async (req, res) => {
-    const { norenordno, uid } = req.body;
-    const jKey = req.query.FLATTRADE_API_TOKEN;
+  router.post("/cancelOrder", requireTradingEnabled, async (req, res) => {
+    const { norenordno } = req.body;
+    const session = getSession(req);
+    const uid = production ? session.userid : req.body.uid;
+    const jKey = session.usersession;
 
     if (!jKey) {
       return res
@@ -359,7 +459,7 @@ module.exports = (storedCredentials) => {
 
     try {
       const response = await axios.post(
-        "https://piconnect.flattrade.in/PiConnectTP/CancelOrder",
+        "https://piconnect.flattrade.in/PiConnectAPI/CancelOrder",
         payload,
         {
           headers: {
@@ -368,13 +468,12 @@ module.exports = (storedCredentials) => {
         }
       );
       res.json(response.data);
-      console.log(`\n Flattrade Cancel Order:`, { norenordno }, response.data);
     } catch (error) {
       res.status(500).json({
         message: "Error cancelling Flattrade order",
         error: error.message,
       });
-      console.error("Error cancelling Flattrade order:", error);
+      console.error("Error cancelling Flattrade order:", error.message);
     }
   });
 

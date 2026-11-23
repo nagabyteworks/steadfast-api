@@ -31,7 +31,15 @@ coverage
 
 *.tsbuildinfo
 
+# Local configuration and private keys
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.key
+*.p12
+*.pfx
+
 !*.csv
 !*.zip
-package-lock.json
 package-lock.json

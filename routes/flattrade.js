@@ -3,6 +3,7 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 const axios = require("axios");
 const NodeCache = require("node-cache");
 const fs = require("fs");
+const path = require("path");
 const csv = require("fast-csv");
 const qs = require("qs");
 const { parse, isBefore } = require("date-fns");
@@ -11,8 +12,47 @@ const requireTradingEnabled = require("../middleware/requireTradingEnabled");
 const requireInternalToken = require("../middleware/requireInternalToken");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
+const lotSizeCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 
-module.exports = (storedCredentials, internalToken, onSessionUpdated = async () => {}) => {
+const readNfoLotSize = (tradingSymbol) => new Promise((resolve, reject) => {
+  const filePath = path.join(__dirname, "../symbols/Nfo_Index_Derivatives.csv");
+  const source = fs.createReadStream(filePath);
+  const parser = source.pipe(csv.parse({ headers: true }));
+  let lotSize = null;
+
+  source.on("error", reject);
+  parser
+    .on("data", (row) => {
+      if (row.Exchange === "NFO" && row.Tradingsymbol === tradingSymbol) {
+        const parsedLotSize = Number(row.Lotsize);
+        if (Number.isSafeInteger(parsedLotSize) && parsedLotSize > 0) {
+          lotSize = parsedLotSize;
+        }
+      }
+    })
+    .on("error", reject)
+    .on("end", () => resolve(lotSize));
+});
+
+const getNfoLotSize = async (tradingSymbol) => {
+  const cachedLotSize = lotSizeCache.get(tradingSymbol);
+  if (cachedLotSize) {
+    return cachedLotSize;
+  }
+
+  const lotSize = await readNfoLotSize(tradingSymbol);
+  if (lotSize) {
+    lotSizeCache.set(tradingSymbol, lotSize);
+  }
+  return lotSize;
+};
+
+module.exports = (
+  storedCredentials,
+  internalToken,
+  onSessionUpdated = async () => {},
+  resolveNfoLotSize = getNfoLotSize
+) => {
   const router = express.Router();
   const production = process.env.NODE_ENV === "production";
   let loginInProgress = false;
@@ -264,11 +304,15 @@ module.exports = (storedCredentials, internalToken, onSessionUpdated = async () 
           row["Symbol"] === masterSymbol &&
           row["Exchange"] === exchangeSymbol
         ) {
+          const parsedLotSize = Number(row["Lotsize"]);
           const strikeData = {
             tradingSymbol: row["Tradingsymbol"],
             securityId: row["Token"],
             expiryDate: row["Expiry"], // Send expiry date without parsing or formatting
             strikePrice: row["Strike"],
+            lotSize: Number.isSafeInteger(parsedLotSize) && parsedLotSize > 0
+              ? parsedLotSize
+              : null,
           };
           if (row["Optiontype"] === "CE") {
             callStrikes.push(strikeData);
@@ -415,7 +459,33 @@ module.exports = (storedCredentials, internalToken, onSessionUpdated = async () 
     }
 
     const jData = typeof req.body === "string" ? qs.parse(req.body) : req.body;
+    if (!jData || typeof jData !== "object" || Array.isArray(jData)) {
+      return res.status(400).json({ message: "Invalid order payload" });
+    }
+
     if (production) {
+      if (jData.exch !== "NFO") {
+        return res.status(403).json({ message: "Production orders are limited to NSE derivatives" });
+      }
+      const quantity = Number(jData.qty);
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({ message: "Order quantity must be a positive whole number" });
+      }
+
+      let lotSize;
+      try {
+        lotSize = await resolveNfoLotSize(jData.tsym);
+      } catch (error) {
+        console.error("Unable to verify Flattrade NFO lot size", { code: error.code });
+        return res.status(503).json({ message: "Unable to verify contract lot size; order was not sent" });
+      }
+      if (!lotSize) {
+        return res.status(400).json({ message: "Unknown NSE derivatives contract; order was not sent" });
+      }
+      if (quantity > lotSize) {
+        return res.status(400).json({ message: "Production orders are limited to one contract lot" });
+      }
+
       jData.uid = storedCredentials.flattrade.userid;
       jData.actid = storedCredentials.flattrade.userid;
     }

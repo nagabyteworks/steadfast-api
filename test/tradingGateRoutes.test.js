@@ -58,7 +58,7 @@ test("production uses a server-managed Flattrade session and blocks browser cred
   });
   Object.assign(process.env, {
     NODE_ENV: "production",
-    TRADING_ENABLED: "true",
+    TRADING_ENABLED: "false",
     FLATTRADE_API_KEY: "fake-key",
     FLATTRADE_API_SECRET: "fake-secret",
     FLATTRADE_CLIENT_ID: "server-user",
@@ -178,4 +178,51 @@ test("enabled order routes forward only to a mocked broker", async (t) => {
     }
   }
   assert.equal(calls.length, 4);
+});
+
+test("production Flattrade accepts only NFO orders no larger than one lot", async (t) => {
+  const originalEnv = { ...process.env };
+  const originalPost = axios.post;
+  t.after(() => {
+    axios.post = originalPost;
+    for (const key of ["NODE_ENV", "TRADING_ENABLED"]) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+  process.env.NODE_ENV = "production";
+  process.env.TRADING_ENABLED = "true";
+
+  const sessions = { flattrade: { usersession: "server-session", userid: "server-user" } };
+  const router = flattradeRoutes(
+    sessions,
+    internalToken,
+    undefined,
+    async (tradingSymbol) => tradingSymbol === "NIFTY-TEST-CE" ? 50 : null
+  );
+  const calls = [];
+  axios.post = async (url, body) => {
+    calls.push({ url, body });
+    return { data: { stat: "Ok", norenordno: "mock-order" } };
+  };
+
+  const baseOrder = { exch: "NFO", tsym: "NIFTY-TEST-CE", qty: "50", uid: "injected-user" };
+  const tooLarge = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "100" });
+  assert.equal(tooLarge.status, 400);
+  assert.equal(calls.length, 0);
+
+  const wrongExchange = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, exch: "BFO" });
+  assert.equal(wrongExchange.status, 403);
+  assert.equal(calls.length, 0);
+
+  const unknownContract = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, tsym: "UNKNOWN" });
+  assert.equal(unknownContract.status, 400);
+  assert.equal(calls.length, 0);
+
+  const accepted = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
+  assert.equal(accepted.status, 200);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].body, /server-session/);
+  assert.match(calls[0].body, /server-user/);
+  assert.doesNotMatch(calls[0].body, /injected-user/);
 });

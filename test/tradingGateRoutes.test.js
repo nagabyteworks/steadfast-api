@@ -206,7 +206,10 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
     return { data: { stat: "Ok", norenordno: "mock-order" } };
   };
 
-  const baseOrder = { exch: "NFO", tsym: "NIFTY-TEST-CE", qty: "50", uid: "injected-user" };
+  const baseOrder = {
+    exch: "NFO", tsym: "NIFTY-TEST-CE", qty: "50", uid: "injected-user",
+    prctyp: "MKT", prc: "0", trantype: "B", prd: "M", ret: "DAY",
+  };
   const tooLarge = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "100" });
   assert.equal(tooLarge.status, 400);
   assert.equal(calls.length, 0);
@@ -218,6 +221,17 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
   const unknownContract = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, tsym: "UNKNOWN" });
   assert.equal(unknownContract.status, 400);
   assert.equal(calls.length, 0);
+
+  for (const extraFields of [
+    { tsym2: "OTHER", qty2: "100" },
+    { tsym3: "OTHER", qty3: "100" },
+    { prctyp: "2L" },
+    { ordersource: "API&jData=other" },
+  ]) {
+    const rejected = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, ...extraFields });
+    assert.equal(rejected.status, 400);
+    assert.equal(calls.length, 0);
+  }
 
   const accepted = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
   assert.equal(accepted.status, 200);

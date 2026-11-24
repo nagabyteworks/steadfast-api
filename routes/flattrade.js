@@ -13,6 +13,10 @@ const requireInternalToken = require("../middleware/requireInternalToken");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 const lotSizeCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
+const productionOrderFields = new Set([
+  "uid", "actid", "exch", "tsym", "qty", "prc", "prd",
+  "trantype", "prctyp", "ret", "ordersource",
+]);
 
 const readNfoLotSize = (tradingSymbol) => new Promise((resolve, reject) => {
   const filePath = path.join(__dirname, "../symbols/Nfo_Index_Derivatives.csv");
@@ -464,11 +468,29 @@ module.exports = (
     }
 
     if (production) {
+      if (Object.keys(jData).some((field) => !productionOrderFields.has(field))) {
+        return res.status(400).json({ message: "Unsupported production order fields" });
+      }
+      if (!["MKT", "LMT"].includes(jData.prctyp)) {
+        return res.status(400).json({ message: "Unsupported production order type" });
+      }
       if (jData.exch !== "NFO") {
         return res.status(403).json({ message: "Production orders are limited to NSE derivatives" });
       }
+      if (
+        typeof jData.tsym !== "string" || !jData.tsym ||
+        !["B", "S"].includes(jData.trantype) ||
+        !["I", "M"].includes(jData.prd) ||
+        jData.ret !== "DAY" ||
+        (jData.ordersource !== undefined && jData.ordersource !== "API") ||
+        !/^\d+(?:\.\d+)?$/.test(String(jData.prc)) ||
+        !Number.isFinite(Number(jData.prc)) ||
+        (jData.prctyp === "LMT" && Number(jData.prc) <= 0)
+      ) {
+        return res.status(400).json({ message: "Invalid production order parameters" });
+      }
       const quantity = Number(jData.qty);
-      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      if (!/^\d+$/.test(String(jData.qty)) || !Number.isSafeInteger(quantity) || quantity <= 0) {
         return res.status(400).json({ message: "Order quantity must be a positive whole number" });
       }
 
@@ -491,7 +513,9 @@ module.exports = (
     }
 
     // const payload = `jKey=${jKey}&jData=${encodeURIComponent(jData)}`; // Not sure if we need this version, so keep it.
-    const payload = `jKey=${jKey}&jData=${JSON.stringify(jData)}`;
+    const payload = production
+      ? qs.stringify({ jKey, jData: JSON.stringify(jData) })
+      : `jKey=${jKey}&jData=${JSON.stringify(jData)}`;
 
     try {
       const response = await axios.post(

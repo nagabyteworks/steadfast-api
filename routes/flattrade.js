@@ -134,15 +134,17 @@ module.exports = (storedCredentials, internalToken, onSessionUpdated = async () 
     }
     res.set("Cache-Control", "no-store").redirect(`https://auth.flattrade.in/?app_key=${encodeURIComponent(apiKey)}`);
   });
-  router.get("/test", (req, res) => {
-    console.log("Test route accessed");
-    res.status(200).json({ message: "Flattrade router is working" });
-  });
+  if (!production) {
+    router.get("/test", (req, res) => {
+      console.log("Test route accessed");
+      res.status(200).json({ message: "Flattrade router is working" });
+    });
 
-  router.head("/test", (req, res) => {
-    console.log("Test route accessed (HEAD)");
-    res.status(200).end();
-  });
+    router.head("/test", (req, res) => {
+      console.log("Test route accessed (HEAD)");
+      res.status(200).end();
+    });
+  }
 
   // ===> NON-TRADING API CALLS  <===
 

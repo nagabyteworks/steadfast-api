@@ -59,6 +59,7 @@ if (config.environment === "production") {
 }
 
 app.get("/", (req, res) => res.send("Welcome to the Steadfast API"));
+app.get("/health", (req, res) => res.status(200).json({ status: "ok" }));
 
 const BROKER_PORTS = config.brokerPorts;
 
@@ -68,7 +69,7 @@ function sendToPythonServer(message) {
     let response = "";
     client.setTimeout(5000, () => client.destroy(new Error("Broker selector timed out")));
     client.connect(pythonServerPort, "127.0.0.1", () => {
-      client.write(JSON.stringify(message));
+      client.write(`${JSON.stringify({ ...message, token: config.internalToken })}\n`);
     });
 
     client.on("data", (data) => {

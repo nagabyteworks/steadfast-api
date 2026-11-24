@@ -76,6 +76,7 @@ test("production uses a server-managed Flattrade session and blocks browser cred
 
   const account = await dispatch(router, "GET", "/account");
   assert.deepEqual(account.body, { configured: true, clientId: "server-user", hasSession: false });
+  await assert.rejects(dispatch(router, "GET", "/test"), /No route handled/);
   const invalid = await dispatch(router, "POST", "/generateToken", {}, {}, { request_code: "" });
   assert.equal(invalid.status, 400);
   const login = await dispatch(router, "POST", "/generateToken", {}, {}, { request_code: "fake-code" });

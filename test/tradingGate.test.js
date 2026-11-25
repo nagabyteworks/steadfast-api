@@ -71,7 +71,7 @@ test("disabled trading blocks both brokers' order routes and proxy bypasses", as
   assert.equal(response.status, 200);
 });
 
-test("explicitly enabled order routes reach only the mocked broker", async () => {
+test("enabled Flattrade routes require server credentials while Shoonya uses the legacy path", async () => {
   process.env.TRADING_ENABLED = "true";
   calls.length = 0;
 
@@ -88,10 +88,15 @@ test("explicitly enabled order routes reach only the mocked broker", async () =>
         },
         body: JSON.stringify({ norenordno: "test-order", uid: "test-user" }),
       });
+      if (broker === "flattrade") {
+        assert.equal(response.status, 403, `${broker}/${path}`);
+        assert.match((await response.json()).message, /requires credentials configured/);
+        continue;
+      }
       assert.equal(response.status, 200, `${broker}/${path}`);
       assert.deepEqual(await response.json(), { stat: "Ok" });
     }
   }
 
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 2);
 });

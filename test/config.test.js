@@ -16,6 +16,10 @@ function readConfig(env) {
     CORS_ORIGIN: "",
     FLATTRADE_WS_PORT: "",
     SHOONYA_WS_PORT: "",
+    FLATTRADE_CLIENT_ID: "",
+    FLATTRADE_API_KEY: "",
+    FLATTRADE_API_SECRET: "",
+    TRADING_ENABLED: "",
     WEBSOCKET_INTERNAL_TOKEN: "a".repeat(32),
     ...env,
   };
@@ -47,6 +51,7 @@ test("development profile enables local defaults and no profile defaults to prod
   assert.equal(development.status, 0, development.stderr);
   const config = JSON.parse(development.stdout);
   assert.equal(config.environment, "development");
+  assert.equal(config.serverManagedAccount, false);
   assert.equal(config.corsHeaders.origin, "http://localhost:5173");
 
   const production = readConfig({ CORS_ORIGIN: "https://trade.example.com" });
@@ -60,6 +65,32 @@ test("development profile enables local defaults and no profile defaults to prod
   });
   assert.equal(explicitProduction.status, 0, explicitProduction.stderr);
   assert.equal(JSON.parse(explicitProduction.stdout).environment, "production");
+});
+
+test("development server-managed Flattrade requires all credentials", () => {
+  const configured = readConfig({
+    profile: "dev",
+    FLATTRADE_CLIENT_ID: "dev-user",
+    FLATTRADE_API_KEY: "dev-key",
+    FLATTRADE_API_SECRET: "dev-secret",
+  });
+  assert.equal(configured.status, 0, configured.stderr);
+  assert.equal(JSON.parse(configured.stdout).serverManagedAccount, true);
+
+  const incomplete = readConfig({
+    profile: "dev",
+    FLATTRADE_CLIENT_ID: "dev-user",
+    FLATTRADE_API_KEY: "dev-key",
+  });
+  assert.notEqual(incomplete.status, 0);
+  assert.match(incomplete.stderr, /must be configured together/);
+
+  const tradingWithoutCredentials = readConfig({
+    profile: "dev",
+    TRADING_ENABLED: "true",
+  });
+  assert.notEqual(tradingWithoutCredentials.status, 0);
+  assert.match(tradingWithoutCredentials.stderr, /requires complete server-managed Flattrade credentials/);
 });
 
 test("invalid profiles and ports are rejected", () => {

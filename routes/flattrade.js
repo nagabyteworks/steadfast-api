@@ -13,7 +13,7 @@ const requireInternalToken = require("../middleware/requireInternalToken");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 const lotSizeCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
-const productionOrderFields = new Set([
+const serverManagedOrderFields = new Set([
   "uid", "actid", "exch", "tsym", "qty", "prc", "prd",
   "trantype", "prctyp", "ret", "ordersource",
 ]);
@@ -57,14 +57,20 @@ module.exports = (
   onSessionUpdated = async () => {},
   resolveNfoLotSize = getNfoLotSize,
   sessionStore = null,
-  environment = process.env.NODE_ENV
+  environment = process.env.NODE_ENV,
+  serverManagedAccount = environment === "production" || Boolean(
+    process.env.FLATTRADE_CLIENT_ID &&
+    process.env.FLATTRADE_API_KEY &&
+    process.env.FLATTRADE_API_SECRET
+  )
 ) => {
   const router = express.Router();
   const production = environment === "production";
+  const restrictedTrading = production || serverManagedAccount;
   let loginInProgress = false;
   const getStoredSession = () => sessionStore ? sessionStore.get() : storedCredentials.flattrade;
 
-  const getSession = (req) => production
+  const getSession = (req) => serverManagedAccount
     ? getStoredSession()
     : {
         usersession: req.query.FLATTRADE_API_TOKEN || req.headers.authorization?.split(" ")[1],
@@ -76,11 +82,19 @@ module.exports = (
     apiSecret: process.env.FLATTRADE_API_SECRET,
     clientId: process.env.FLATTRADE_CLIENT_ID,
   });
+  const requireServerManagedTrading = (req, res, next) => {
+    if (!serverManagedAccount) {
+      return res.status(403).json({
+        message: "Flattrade live trading requires credentials configured in the API environment",
+      });
+    }
+    next();
+  };
 
   router.use(
     "/flattradeApi",
-    (req, res, next) => production
-      ? res.status(403).json({ message: "Raw broker proxy is disabled in production" })
+    (req, res, next) => serverManagedAccount
+      ? res.status(403).json({ message: "Raw broker proxy is disabled for server-managed accounts" })
       : next(),
     requireTradingEnabled,
     createProxyMiddleware({
@@ -93,7 +107,7 @@ module.exports = (
   );
   router.post("/generateToken", async (req, res) => {
     console.log("Received generateToken request");
-    if (production) {
+    if (serverManagedAccount) {
       const { apiKey, apiSecret, clientId } = configuredAccount();
       const requestCode = req.body?.request_code;
       if (!apiKey || !apiSecret || !clientId) {
@@ -166,8 +180,8 @@ module.exports = (
     }
   });
   router.get("/account", (req, res) => {
-    if (!production) {
-      return res.status(404).json({ message: "Server-managed account is only available in production" });
+    if (!serverManagedAccount) {
+      return res.status(404).json({ message: "Server-managed account is not enabled" });
     }
     const { apiKey, apiSecret, clientId } = configuredAccount();
     const configured = Boolean(apiKey && apiSecret && clientId);
@@ -181,7 +195,7 @@ module.exports = (
   });
   router.get("/auth", (req, res) => {
     const { apiKey, apiSecret, clientId } = configuredAccount();
-    if (!production || !apiKey || !apiSecret || !clientId) {
+    if (!serverManagedAccount || !apiKey || !apiSecret || !clientId) {
       return res.status(503).json({ message: "Flattrade account is not configured on the server" });
     }
     res.set("Cache-Control", "no-store").redirect(`https://auth.flattrade.in/?app_key=${encodeURIComponent(apiKey)}`);
@@ -202,8 +216,8 @@ module.exports = (
 
   // ===> Endpoint to store the credentials
   router.post("/setCredentials", (req, res) => {
-    if (production) {
-      return res.status(403).json({ message: "Browser-provided broker credentials are disabled in production" });
+    if (serverManagedAccount) {
+      return res.status(403).json({ message: "Browser-provided credentials are disabled for server-managed accounts" });
     }
     console.log("Received POST request to set credentials");
     const { usersession, userid } = req.body;
@@ -225,7 +239,7 @@ module.exports = (
     // console.log("Received GET request for flattrade websocket data");
 
     // Use the stored credentials
-    const { usersession, userid } = production ? getStoredSession() : storedCredentials.flattrade;
+    const { usersession, userid } = serverManagedAccount ? getStoredSession() : storedCredentials.flattrade;
     const websocketData = { usersession, userid };
 
     res.set("Cache-Control", "no-store").json(websocketData);
@@ -459,7 +473,7 @@ module.exports = (
   //===> TRADING API CALLS <===
 
   // ===> Place Flattrade Order
-  router.post("/placeOrder", requireTradingEnabled, async (req, res) => {
+  router.post("/placeOrder", requireTradingEnabled, requireServerManagedTrading, async (req, res) => {
     const { usersession: jKey } = getSession(req);
 
     if (!jKey) {
@@ -473,15 +487,15 @@ module.exports = (
       return res.status(400).json({ message: "Invalid order payload" });
     }
 
-    if (production) {
-      if (Object.keys(jData).some((field) => !productionOrderFields.has(field))) {
-        return res.status(400).json({ message: "Unsupported production order fields" });
+    if (restrictedTrading) {
+      if (Object.keys(jData).some((field) => !serverManagedOrderFields.has(field))) {
+        return res.status(400).json({ message: "Unsupported server-managed order fields" });
       }
       if (!["MKT", "LMT"].includes(jData.prctyp)) {
-        return res.status(400).json({ message: "Unsupported production order type" });
+        return res.status(400).json({ message: "Unsupported server-managed order type" });
       }
       if (jData.exch !== "NFO") {
-        return res.status(403).json({ message: "Production orders are limited to NSE derivatives" });
+        return res.status(403).json({ message: "Server-managed orders are limited to NSE derivatives" });
       }
       if (
         typeof jData.tsym !== "string" || !jData.tsym ||
@@ -493,7 +507,7 @@ module.exports = (
         !Number.isFinite(Number(jData.prc)) ||
         (jData.prctyp === "LMT" && Number(jData.prc) <= 0)
       ) {
-        return res.status(400).json({ message: "Invalid production order parameters" });
+        return res.status(400).json({ message: "Invalid server-managed order parameters" });
       }
       const quantity = Number(jData.qty);
       if (!/^\d+$/.test(String(jData.qty)) || !Number.isSafeInteger(quantity) || quantity <= 0) {
@@ -511,7 +525,7 @@ module.exports = (
         return res.status(400).json({ message: "Unknown NSE derivatives contract; order was not sent" });
       }
       if (quantity > lotSize) {
-        return res.status(400).json({ message: "Production orders are limited to one contract lot" });
+        return res.status(400).json({ message: "Server-managed orders are limited to one contract lot" });
       }
 
       const currentSession = getSession(req);
@@ -522,16 +536,16 @@ module.exports = (
       jData.actid = currentSession.userid;
     }
 
-    if (production && (
+    if (restrictedTrading && (
       typeof jKey !== "string" || /[&\r\n]/.test(jKey) ||
       typeof jData.uid !== "string" || !jData.uid || /[&\r\n]/.test(jData.uid)
     )) {
       return res.status(503).json({ message: "Invalid broker session; order was not sent" });
     }
-    const brokerOrder = production
+    const brokerOrder = restrictedTrading
       ? { ...jData, tsym: encodeURIComponent(jData.tsym).replace(/%20/g, "+").replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`) }
       : jData;
-    const payload = production
+    const payload = restrictedTrading
       ? `jData=${JSON.stringify(brokerOrder)}&jKey=${jKey}`
       : `jKey=${jKey}&jData=${JSON.stringify(jData)}`;
 
@@ -563,10 +577,10 @@ module.exports = (
   });
 
   // ===> Cancel Flattrade Order
-  router.post("/cancelOrder", requireTradingEnabled, async (req, res) => {
+  router.post("/cancelOrder", requireTradingEnabled, requireServerManagedTrading, async (req, res) => {
     const { norenordno } = req.body;
     const session = getSession(req);
-    const uid = production ? session.userid : req.body.uid;
+    const uid = serverManagedAccount ? session.userid : req.body.uid;
     const jKey = session.usersession;
 
     if (!jKey) {

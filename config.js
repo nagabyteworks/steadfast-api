@@ -9,6 +9,27 @@ if (!["dev", "prod"].includes(profile)) {
 const environment = profile === "dev" ? "development" : "production";
 process.env.NODE_ENV = environment;
 
+const flattradeCredentials = [
+  process.env.FLATTRADE_CLIENT_ID,
+  process.env.FLATTRADE_API_KEY,
+  process.env.FLATTRADE_API_SECRET,
+];
+const hasFlattradeCredentials = flattradeCredentials.every(Boolean);
+if (
+  environment === "development" &&
+  flattradeCredentials.some(Boolean) &&
+  !hasFlattradeCredentials
+) {
+  throw new Error("FLATTRADE_CLIENT_ID, FLATTRADE_API_KEY, and FLATTRADE_API_SECRET must be configured together");
+}
+if (
+  environment === "development" &&
+  process.env.TRADING_ENABLED === "true" &&
+  !hasFlattradeCredentials
+) {
+  throw new Error("TRADING_ENABLED=true requires complete server-managed Flattrade credentials");
+}
+
 function readPort(name, defaultPort) {
   const port = Number(process.env[name] || defaultPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -53,6 +74,7 @@ if (environment === "production" && !["127.0.0.1", "::1", "localhost"].includes(
 
 module.exports = {
   environment,
+  serverManagedAccount: environment === "production" || hasFlattradeCredentials,
   internalToken,
   port: readPort("PORT", 3000),
   host,

@@ -120,6 +120,72 @@ test("production uses a server-managed Flattrade session and blocks browser cred
   assert.equal((await firstLogin).status, 200);
 });
 
+test("development server-managed Flattrade uses .env credentials and live order limits", async (t) => {
+  const originalEnv = { ...process.env };
+  const originalPost = axios.post;
+  t.after(() => {
+    axios.post = originalPost;
+    for (const key of ["TRADING_ENABLED", "FLATTRADE_API_KEY", "FLATTRADE_API_SECRET", "FLATTRADE_CLIENT_ID"]) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+  Object.assign(process.env, {
+    TRADING_ENABLED: "true",
+    FLATTRADE_API_KEY: "local-key",
+    FLATTRADE_API_SECRET: "local-secret",
+    FLATTRADE_CLIENT_ID: "local-user",
+  });
+  const sessions = { flattrade: { usersession: "", userid: "" } };
+  const calls = [];
+  const router = flattradeRoutes(
+    sessions,
+    internalToken,
+    async () => {},
+    async () => 50,
+    null,
+    "development",
+    true
+  );
+  axios.post = async (url, body) => {
+    calls.push({ url, body });
+    return url.includes("/apitoken")
+      ? { data: { token: "local-session", status: "Ok", client: "local-user" } }
+      : { data: { stat: "Ok", norenordno: "mock-order" } };
+  };
+
+  const account = await dispatch(router, "GET", "/account");
+  assert.deepEqual(account.body, { configured: true, clientId: "local-user", hasSession: false });
+  const login = await dispatch(router, "POST", "/generateToken", {}, {}, { request_code: "local-code" });
+  assert.equal(login.status, 200);
+  assert.deepEqual(sessions.flattrade, { usersession: "local-session", userid: "local-user" });
+  assert.equal(calls[0].body.api_key, "local-key");
+
+  const deniedCredentials = await dispatch(router, "POST", "/setCredentials");
+  assert.equal(deniedCredentials.status, 403);
+  const orderData = {
+    uid: "attacker-user",
+    actid: "attacker-user",
+    exch: "NFO",
+    tsym: "TEST CE",
+    qty: "50",
+    prc: "0",
+    prd: "M",
+    trantype: "B",
+    prctyp: "MKT",
+    ret: "DAY",
+    ordersource: "API",
+  };
+  const order = await dispatch(router, "POST", "/placeOrder", {}, {}, orderData);
+  assert.equal(order.status, 200);
+  assert.match(calls[1].body, /"uid":"local-user"/);
+  assert.doesNotMatch(calls[1].body, /attacker-user/);
+
+  const tooLarge = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...orderData, qty: "51" });
+  assert.equal(tooLarge.status, 400);
+  assert.equal(calls.length, 2);
+});
+
 test("broker credential endpoints require the internal token", async () => {
   for (const router of Object.values(routers)) {
     const denied = await dispatch(router, "GET", "/websocketData");
@@ -158,7 +224,7 @@ test("disabled trading blocks order routes and arbitrary broker proxies without 
   assert.equal(readOnly.status, 200);
 });
 
-test("enabled order routes forward only to a mocked broker", async (t) => {
+test("enabled legacy order routes remain available only for Shoonya", async (t) => {
   const originalFlag = process.env.TRADING_ENABLED;
   const originalPost = axios.post;
   const calls = [];
@@ -173,15 +239,21 @@ test("enabled order routes forward only to a mocked broker", async (t) => {
     return { data: { stat: "Ok" } };
   };
 
-  for (const [broker, router] of Object.entries(routers)) {
-    const query = { [`${broker.toUpperCase()}_API_TOKEN`]: "mock-token" };
-    for (const url of ["/placeOrder", "/cancelOrder"]) {
-      const response = await dispatch(router, "POST", url, query);
-      assert.equal(response.status, 200, `${broker} ${url}`);
-      assert.deepEqual(response.body, { stat: "Ok" });
-    }
+  for (const url of ["/placeOrder", "/cancelOrder"]) {
+    const response = await dispatch(routers.shoonya, "POST", url, {
+      SHOONYA_API_TOKEN: "mock-token",
+    });
+    assert.equal(response.status, 200, `Shoonya ${url}`);
+    assert.deepEqual(response.body, { stat: "Ok" });
   }
-  assert.equal(calls.length, 4);
+  for (const url of ["/placeOrder", "/cancelOrder"]) {
+    const response = await dispatch(routers.flattrade, "POST", url, {
+      FLATTRADE_API_TOKEN: "mock-token",
+    });
+    assert.equal(response.status, 403, `Flattrade ${url}`);
+    assert.match(response.body.message, /requires credentials configured/);
+  }
+  assert.equal(calls.length, 2);
 });
 
 test("production Flattrade accepts only NFO orders no larger than one lot", async (t) => {

@@ -62,13 +62,13 @@ const pythonServerPort = 5000; // Choose an available port
 
 app.set("case sensitive routing", false);
 app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, async () => {
-  if (config.environment === "production" || selectedBroker === "flattrade") {
+  if (config.serverManagedAccount || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}, undefined, sessionStore, config.environment));
-if (config.environment === "production") {
+}, undefined, sessionStore, config.environment, config.serverManagedAccount));
+if (config.serverManagedAccount) {
   app.use("/shoonya", (req, res) => {
-    res.status(503).json({ message: "Shoonya is unavailable in production until server-managed sessions are implemented" });
+    res.status(503).json({ message: "Shoonya is unavailable in server-managed mode" });
   });
 } else {
   app.use("/shoonya", shoonyaRoutes(storedCredentials, config.internalToken));
@@ -125,7 +125,7 @@ function sendToPythonServer(message) {
 
 app.post("/set-broker", async (req, res) => {
   const { broker } = req.body;
-  if (broker === "flattrade" || (config.environment !== "production" && broker === "shoonya")) {
+  if (broker === "flattrade" || (!config.serverManagedAccount && broker === "shoonya")) {
     try {
       // Send the broker selection to the Python server
       await sendToPythonServer({

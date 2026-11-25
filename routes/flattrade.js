@@ -20,8 +20,9 @@ const serverManagedOrderFields = new Set([
   "trantype", "prctyp", "ret", "ordersource",
 ]);
 
-const readNfoLotSize = (tradingSymbol) => new Promise((resolve, reject) => {
-  const filePath = path.join(__dirname, "../symbols/Nfo_Index_Derivatives.csv");
+const lotSizeFiles = { NFO: "Nfo_Index_Derivatives.csv", BFO: "Bfo_Index_Derivatives.csv" };
+const readNfoLotSize = (tradingSymbol, exchange = "NFO") => new Promise((resolve, reject) => {
+  const filePath = path.join(__dirname, "../symbols", lotSizeFiles[exchange]);
   const source = fs.createReadStream(filePath);
   const parser = source.pipe(csv.parse({ headers: true }));
   let lotSize = null;
@@ -29,7 +30,7 @@ const readNfoLotSize = (tradingSymbol) => new Promise((resolve, reject) => {
   source.on("error", reject);
   parser
     .on("data", (row) => {
-      if (row.Exchange === "NFO" && row.Tradingsymbol === tradingSymbol) {
+      if (row.Exchange === exchange && row.Tradingsymbol === tradingSymbol) {
         const parsedLotSize = Number(row.Lotsize);
         if (Number.isSafeInteger(parsedLotSize) && parsedLotSize > 0) {
           lotSize = parsedLotSize;
@@ -40,15 +41,16 @@ const readNfoLotSize = (tradingSymbol) => new Promise((resolve, reject) => {
     .on("end", () => resolve(lotSize));
 });
 
-const getNfoLotSize = async (tradingSymbol) => {
-  const cachedLotSize = lotSizeCache.get(tradingSymbol);
+const getNfoLotSize = async (tradingSymbol, exchange = "NFO") => {
+  const cacheKey = `${exchange}|${tradingSymbol}`;
+  const cachedLotSize = lotSizeCache.get(cacheKey);
   if (cachedLotSize) {
     return cachedLotSize;
   }
 
-  const lotSize = await readNfoLotSize(tradingSymbol);
+  const lotSize = await readNfoLotSize(tradingSymbol, exchange);
   if (lotSize) {
-    lotSizeCache.set(tradingSymbol, lotSize);
+    lotSizeCache.set(cacheKey, lotSize);
   }
   return lotSize;
 };
@@ -502,8 +504,8 @@ module.exports = (
       if (!["MKT", "LMT"].includes(jData.prctyp)) {
         return res.status(400).json({ message: "Unsupported server-managed order type" });
       }
-      if (jData.exch !== "NFO") {
-        return res.status(403).json({ message: "Server-managed orders are limited to NSE derivatives" });
+      if (!["NFO", "BFO"].includes(jData.exch)) {
+        return res.status(403).json({ message: "Server-managed orders are limited to NSE and BSE index derivatives" });
       }
       if (
         typeof jData.tsym !== "string" || !jData.tsym ||
@@ -524,13 +526,13 @@ module.exports = (
 
       let lotSize;
       try {
-        lotSize = await resolveNfoLotSize(jData.tsym);
+        lotSize = await resolveNfoLotSize(jData.tsym, jData.exch);
       } catch (error) {
         console.error("Unable to verify Flattrade NFO lot size", { code: error.code });
         return res.status(503).json({ message: "Unable to verify contract lot size; order was not sent" });
       }
       if (!lotSize) {
-        return res.status(400).json({ message: "Unknown NSE derivatives contract; order was not sent" });
+        return res.status(400).json({ message: "Unknown index derivatives contract; order was not sent" });
       }
       if (quantity % lotSize !== 0 || quantity > lotSize * MAX_ORDER_LOTS) {
         return res.status(400).json({ message: `Server-managed orders must be 1 to ${MAX_ORDER_LOTS} whole contract lots` });

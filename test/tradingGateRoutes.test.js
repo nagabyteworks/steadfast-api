@@ -256,7 +256,7 @@ test("enabled legacy order routes remain available only for Shoonya", async (t) 
   assert.equal(calls.length, 2);
 });
 
-test("production Flattrade accepts only NFO orders of 1 to 10 whole lots", async (t) => {
+test("production Flattrade accepts only NFO and BFO orders of 1 to 10 whole lots", async (t) => {
   const originalEnv = { ...process.env };
   const originalPost = axios.post;
   t.after(() => {
@@ -298,7 +298,7 @@ test("production Flattrade accepts only NFO orders of 1 to 10 whole lots", async
   assert.equal(multiLot.status, 200);
   calls.length = 0;
 
-  const wrongExchange = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, exch: "BFO" });
+  const wrongExchange = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, exch: "MCX" });
   assert.equal(wrongExchange.status, 403);
   assert.equal(calls.length, 0);
 

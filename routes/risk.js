@@ -127,7 +127,7 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
         store.finish(tsym, "dry_run", `${note}: dry run, no order sent`);
         return noStore(res).json({ handled: true, status: "dry_run" });
       }
-      if (!tradingEnabled() || position.exch !== "NFO") {
+      if (!tradingEnabled() || !["NFO", "BFO"].includes(position.exch)) {
         store.finish(tsym, "failed", `${note}: trading disabled or unsupported exchange`);
         return noStore(res).json({ handled: true, status: "failed" });
       }

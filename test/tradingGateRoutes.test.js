@@ -256,7 +256,7 @@ test("enabled legacy order routes remain available only for Shoonya", async (t) 
   assert.equal(calls.length, 2);
 });
 
-test("production Flattrade accepts only NFO orders no larger than one lot", async (t) => {
+test("production Flattrade accepts only NFO orders of 1 to 10 whole lots", async (t) => {
   const originalEnv = { ...process.env };
   const originalPost = axios.post;
   t.after(() => {
@@ -286,9 +286,17 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
     exch: "NFO", tsym: "NIFTY-TEST-CE", qty: "50", uid: "injected-user",
     prctyp: "MKT", prc: "0", trantype: "B", prd: "M", ret: "DAY",
   };
-  const tooLarge = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "100" });
+  const tooLarge = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "550" });
   assert.equal(tooLarge.status, 400);
   assert.equal(calls.length, 0);
+
+  const partialLot = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "75" });
+  assert.equal(partialLot.status, 400);
+  assert.equal(calls.length, 0);
+
+  const multiLot = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, qty: "500" });
+  assert.equal(multiLot.status, 200);
+  calls.length = 0;
 
   const wrongExchange = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, exch: "BFO" });
   assert.equal(wrongExchange.status, 403);

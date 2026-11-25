@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { createRiskStore, validateRule } = require("../riskStore");
+const { marketableLimitPrice } = require("../routes/risk");
 
 const input = (overrides = {}) => ({
   instrument: "NFO|123", side: "long", entry: 100, mode: "target_trail",
@@ -47,4 +48,11 @@ test("each mode validates its own required fields", () => {
   assert.throws(() => validateRule("X", input({ side: "short", slPrice: 90, targetPrice: 95 })), /./);
   const short = validateRule("X", input({ side: "short", slPrice: 110, targetPrice: 80 }));
   assert.equal(short.side, "short");
+});
+
+test("exit orders are limit prices through the market because Flattrade rejects MKT", () => {
+  assert.equal(marketableLimitPrice(100, true), "98.00");
+  assert.equal(marketableLimitPrice(100, false), "102.00");
+  assert.equal(marketableLimitPrice(0.05, true), "0.05");
+  assert.throws(() => marketableLimitPrice(undefined, true), /live price/);
 });

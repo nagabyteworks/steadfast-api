@@ -15,7 +15,17 @@ async function findOpenPosition(session, tsym) {
   return data.find((position) => position.tsym === tsym && Number(position.netqty) !== 0) || null;
 }
 
-async function submitExit(session, position) {
+// Flattrade rejects MKT orders from the API ("ALGO_CHK"), so exits are limit orders priced
+// through the market by a small buffer to fill like a market order.
+const EXIT_PRICE_BUFFER = 0.02;
+function marketableLimitPrice(ltp, selling) {
+  const price = Number(ltp);
+  if (!Number.isFinite(price) || price <= 0) throw new Error("No live price for the exit order");
+  const ticks = (price * (selling ? 1 - EXIT_PRICE_BUFFER : 1 + EXIT_PRICE_BUFFER)) / 0.05;
+  return Math.max(0.05, (selling ? Math.floor(ticks) : Math.ceil(ticks)) * 0.05).toFixed(2);
+}
+
+async function submitExit(session, position, ltp) {
   const netQty = Number(position.netqty);
   const order = {
     uid: session.userid,
@@ -23,10 +33,10 @@ async function submitExit(session, position) {
     exch: position.exch,
     tsym: encodeSymbol(position.tsym),
     qty: String(Math.abs(netQty)),
-    prc: "0",
+    prc: marketableLimitPrice(ltp, netQty > 0),
     prd: position.prd,
     trantype: netQty > 0 ? "S" : "B",
-    prctyp: "MKT",
+    prctyp: "LMT",
     ret: "DAY",
     ordersource: "API",
   };
@@ -121,7 +131,7 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
         store.finish(tsym, "failed", `${note}: trading disabled or unsupported exchange`);
         return noStore(res).json({ handled: true, status: "failed" });
       }
-      await submitExit(session, position);
+      await submitExit(session, position, ltp);
       console.log(`Risk exit submitted for ${tsym}`);
       store.finish(tsym, "done", `${note}: exit order submitted`);
       noStore(res).json({ handled: true, status: "done" });
@@ -135,3 +145,5 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
 
   return router;
 };
+
+module.exports.marketableLimitPrice = marketableLimitPrice;

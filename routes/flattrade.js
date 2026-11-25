@@ -13,6 +13,7 @@ const requireInternalToken = require("../middleware/requireInternalToken");
 const createRiskRouter = require("./risk");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
+const MAX_ORDER_LOTS = 10;
 const lotSizeCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 const serverManagedOrderFields = new Set([
   "uid", "actid", "exch", "tsym", "qty", "prc", "prd",
@@ -531,8 +532,8 @@ module.exports = (
       if (!lotSize) {
         return res.status(400).json({ message: "Unknown NSE derivatives contract; order was not sent" });
       }
-      if (quantity > lotSize) {
-        return res.status(400).json({ message: "Server-managed orders are limited to one contract lot" });
+      if (quantity % lotSize !== 0 || quantity > lotSize * MAX_ORDER_LOTS) {
+        return res.status(400).json({ message: `Server-managed orders must be 1 to ${MAX_ORDER_LOTS} whole contract lots` });
       }
 
       const currentSession = getSession(req);

@@ -6,9 +6,22 @@ const path = require("node:path");
 const configPath = path.join(__dirname, "../config.js");
 
 function readConfig(env) {
+  const childEnv = {
+    ...process.env,
+    profile: "",
+    PROFILE: "",
+    NODE_ENV: "production",
+    PORT: "",
+    API_HOST: "",
+    CORS_ORIGIN: "",
+    FLATTRADE_WS_PORT: "",
+    SHOONYA_WS_PORT: "",
+    WEBSOCKET_INTERNAL_TOKEN: "a".repeat(32),
+    ...env,
+  };
   return spawnSync(process.execPath, ["-e", `console.log(JSON.stringify(require(${JSON.stringify(configPath)})))`], {
     encoding: "utf8",
-    env: { ...process.env, NODE_ENV: "production", PORT: "", API_HOST: "", CORS_ORIGIN: "", FLATTRADE_WS_PORT: "", SHOONYA_WS_PORT: "", WEBSOCKET_INTERNAL_TOKEN: "a".repeat(32), ...env },
+    env: childEnv,
   });
 }
 
@@ -26,15 +39,33 @@ test("production listens on loopback and uses configured origin and port", () =>
   assert.equal(config.port, 3001);
   assert.equal(config.brokerPorts.flattrade, 9001);
   assert.equal(config.corsHeaders.origin, "https://trade.example.com");
+  assert.equal(config.environment, "production");
 });
 
-test("invalid environments and ports are rejected", () => {
-  const invalidEnvironment = readConfig({ NODE_ENV: "staging" });
-  assert.notEqual(invalidEnvironment.status, 0);
-  assert.match(invalidEnvironment.stderr, /NODE_ENV must be/);
-  const missingEnvironment = readConfig({ NODE_ENV: "" });
-  assert.notEqual(missingEnvironment.status, 0);
-  assert.match(missingEnvironment.stderr, /NODE_ENV must be/);
+test("development profile enables local defaults and no profile defaults to production", () => {
+  const development = readConfig({ profile: "dev" });
+  assert.equal(development.status, 0, development.stderr);
+  const config = JSON.parse(development.stdout);
+  assert.equal(config.environment, "development");
+  assert.equal(config.corsHeaders.origin, "http://localhost:5173");
+
+  const production = readConfig({ CORS_ORIGIN: "https://trade.example.com" });
+  assert.equal(production.status, 0, production.stderr);
+  assert.equal(JSON.parse(production.stdout).environment, "production");
+
+  const explicitProduction = readConfig({
+    profile: "dev",
+    PROFILE: "prod",
+    CORS_ORIGIN: "https://trade.example.com",
+  });
+  assert.equal(explicitProduction.status, 0, explicitProduction.stderr);
+  assert.equal(JSON.parse(explicitProduction.stdout).environment, "production");
+});
+
+test("invalid profiles and ports are rejected", () => {
+  const invalidProfile = readConfig({ profile: "staging" });
+  assert.notEqual(invalidProfile.status, 0);
+  assert.match(invalidProfile.stderr, /profile must be dev or prod/);
   const invalidPort = readConfig({ CORS_ORIGIN: "https://trade.example.com", PORT: "invalid" });
   assert.notEqual(invalidPort.status, 0);
   assert.match(invalidPort.stderr, /PORT must be/);

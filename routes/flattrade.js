@@ -56,10 +56,11 @@ module.exports = (
   internalToken,
   onSessionUpdated = async () => {},
   resolveNfoLotSize = getNfoLotSize,
-  sessionStore = null
+  sessionStore = null,
+  environment = process.env.NODE_ENV
 ) => {
   const router = express.Router();
-  const production = process.env.NODE_ENV === "production";
+  const production = environment === "production";
   let loginInProgress = false;
   const getStoredSession = () => sessionStore ? sessionStore.get() : storedCredentials.flattrade;
 

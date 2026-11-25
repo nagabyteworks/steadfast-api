@@ -1,8 +1,13 @@
-const environment = process.env.NODE_ENV;
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 
-if (!["development", "production"].includes(environment)) {
-  throw new Error("NODE_ENV must be development or production");
+const profile = (process.env.PROFILE || process.env.profile || "prod").trim().toLowerCase();
+if (!["dev", "prod"].includes(profile)) {
+  throw new Error("profile must be dev or prod");
 }
+
+const environment = profile === "dev" ? "development" : "production";
+process.env.NODE_ENV = environment;
 
 function readPort(name, defaultPort) {
   const port = Number(process.env[name] || defaultPort);

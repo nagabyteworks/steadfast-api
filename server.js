@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-require("dotenv").config();
 const config = require("./config");
 const net = require("net");
 
@@ -66,7 +65,7 @@ app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, a
   if (config.environment === "production" || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}, undefined, sessionStore));
+}, undefined, sessionStore, config.environment));
 if (config.environment === "production") {
   app.use("/shoonya", (req, res) => {
     res.status(503).json({ message: "Shoonya is unavailable in production until server-managed sessions are implemented" });

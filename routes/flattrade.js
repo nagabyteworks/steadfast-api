@@ -55,14 +55,16 @@ module.exports = (
   storedCredentials,
   internalToken,
   onSessionUpdated = async () => {},
-  resolveNfoLotSize = getNfoLotSize
+  resolveNfoLotSize = getNfoLotSize,
+  sessionStore = null
 ) => {
   const router = express.Router();
   const production = process.env.NODE_ENV === "production";
   let loginInProgress = false;
+  const getStoredSession = () => sessionStore ? sessionStore.get() : storedCredentials.flattrade;
 
   const getSession = (req) => production
-    ? storedCredentials.flattrade
+    ? getStoredSession()
     : {
         usersession: req.query.FLATTRADE_API_TOKEN || req.headers.authorization?.split(" ")[1],
         userid: req.query.FLATTRADE_CLIENT_ID,
@@ -103,8 +105,9 @@ module.exports = (
         return res.status(409).json({ message: "A Flattrade session exchange is already in progress" });
       }
       loginInProgress = true;
-      storedCredentials.flattrade = { usersession: "", userid: "" };
       try {
+        if (sessionStore) sessionStore.clear();
+        storedCredentials.flattrade = { usersession: "", userid: "" };
         const apiSecretHash = createHash("sha256")
           .update(apiKey + requestCode + apiSecret)
           .digest("hex");
@@ -122,7 +125,9 @@ module.exports = (
         ) {
           return res.status(502).json({ message: "Flattrade did not issue a session for the configured account" });
         }
-        storedCredentials.flattrade = { usersession: response.data.token, userid: clientId };
+        const session = { usersession: response.data.token, userid: clientId };
+        if (sessionStore) sessionStore.set(session);
+        else storedCredentials.flattrade = session;
         try {
           await onSessionUpdated();
         } catch (error) {
@@ -165,10 +170,12 @@ module.exports = (
     }
     const { apiKey, apiSecret, clientId } = configuredAccount();
     const configured = Boolean(apiKey && apiSecret && clientId);
+    const session = getStoredSession();
     res.set("Cache-Control", "no-store").json({
       configured,
       clientId: configured ? clientId : null,
-      hasSession: Boolean(storedCredentials.flattrade.usersession),
+      hasSession: Boolean(session.usersession),
+      ...(session.expiresAt && { expiresAt: new Date(session.expiresAt).toISOString() }),
     });
   });
   router.get("/auth", (req, res) => {
@@ -217,10 +224,8 @@ module.exports = (
     // console.log("Received GET request for flattrade websocket data");
 
     // Use the stored credentials
-    const websocketData = {
-      usersession: storedCredentials.flattrade.usersession,
-      userid: storedCredentials.flattrade.userid,
-    };
+    const { usersession, userid } = production ? getStoredSession() : storedCredentials.flattrade;
+    const websocketData = { usersession, userid };
 
     res.set("Cache-Control", "no-store").json(websocketData);
     console.log(
@@ -508,13 +513,25 @@ module.exports = (
         return res.status(400).json({ message: "Production orders are limited to one contract lot" });
       }
 
-      jData.uid = storedCredentials.flattrade.userid;
-      jData.actid = storedCredentials.flattrade.userid;
+      const currentSession = getSession(req);
+      if (!currentSession.usersession || currentSession.usersession !== jKey) {
+        return res.status(401).json({ message: "Broker session changed; order was not sent" });
+      }
+      jData.uid = currentSession.userid;
+      jData.actid = currentSession.userid;
     }
 
-    // const payload = `jKey=${jKey}&jData=${encodeURIComponent(jData)}`; // Not sure if we need this version, so keep it.
+    if (production && (
+      typeof jKey !== "string" || /[&\r\n]/.test(jKey) ||
+      typeof jData.uid !== "string" || !jData.uid || /[&\r\n]/.test(jData.uid)
+    )) {
+      return res.status(503).json({ message: "Invalid broker session; order was not sent" });
+    }
+    const brokerOrder = production
+      ? { ...jData, tsym: encodeURIComponent(jData.tsym).replace(/%20/g, "+").replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`) }
+      : jData;
     const payload = production
-      ? qs.stringify({ jKey, jData: JSON.stringify(jData) })
+      ? `jData=${JSON.stringify(brokerOrder)}&jKey=${jKey}`
       : `jKey=${jKey}&jData=${JSON.stringify(jData)}`;
 
     try {

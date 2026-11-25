@@ -1,9 +1,13 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const axios = require("axios");
 const flattradeRoutes = require("../routes/flattrade");
 const shoonyaRoutes = require("../routes/shoonya");
+const { createSessionStore } = require("../sessionStore");
 
 const internalToken = "a".repeat(32);
 const credentials = {
@@ -198,7 +202,7 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
     sessions,
     internalToken,
     undefined,
-    async (tradingSymbol) => tradingSymbol === "NIFTY-TEST-CE" ? 50 : null
+    async (tradingSymbol) => ["NIFTY-TEST-CE", "TEST&+ CE"].includes(tradingSymbol) ? 50 : null
   );
   const calls = [];
   axios.post = async (url, body) => {
@@ -239,6 +243,17 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
   assert.match(calls[0].body, /server-session/);
   assert.match(calls[0].body, /server-user/);
   assert.doesNotMatch(calls[0].body, /injected-user/);
+  const [data, key] = calls[0].body.split("&jKey=");
+  assert.equal(key, "server-session");
+  assert.deepEqual(JSON.parse(data.slice("jData=".length)), {
+    ...baseOrder, uid: "server-user", actid: "server-user",
+  });
+
+  const specialSymbol = await dispatch(router, "POST", "/placeOrder", {}, {}, { ...baseOrder, tsym: "TEST&+ CE" });
+  assert.equal(specialSymbol.status, 200);
+  const [specialData, specialKey] = calls[1].body.split("&jKey=");
+  assert.equal(specialKey, "server-session");
+  assert.equal(JSON.parse(specialData.slice("jData=".length)).tsym, "TEST%26%2B+CE");
 
   axios.post = async () => {
     throw {
@@ -258,4 +273,36 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
   axios.post = async () => { throw new Error("network failure"); };
   const uncertain = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
   assert.match(uncertain.body.message, /uncertain.*before retrying/i);
+});
+
+test("production login persists the session for a recreated router", async (t) => {
+  const originalEnv = { ...process.env };
+  const originalPost = axios.post;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-route-session-"));
+  let store;
+  t.after(() => {
+    if (store) store.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+    axios.post = originalPost;
+    for (const key of ["NODE_ENV", "FLATTRADE_API_KEY", "FLATTRADE_API_SECRET", "FLATTRADE_CLIENT_ID"]) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+  Object.assign(process.env, {
+    NODE_ENV: "production",
+    FLATTRADE_API_KEY: "fake-key",
+    FLATTRADE_API_SECRET: "fake-secret",
+    FLATTRADE_CLIENT_ID: "server-user",
+  });
+  axios.post = async () => ({ data: { status: "Ok", client: "server-user", token: "server-session" } });
+  store = createSessionStore(directory, "server-user");
+  let router = flattradeRoutes({ flattrade: {} }, internalToken, async () => {}, undefined, store);
+  assert.equal((await dispatch(router, "POST", "/generateToken", {}, {}, { request_code: "fake-code" })).status, 200);
+  store.close();
+  store = createSessionStore(directory, "server-user");
+  router = flattradeRoutes({ flattrade: {} }, internalToken, async () => {}, undefined, store);
+  assert.equal((await dispatch(router, "GET", "/account")).body.hasSession, true);
+  const credentials = await dispatch(router, "GET", "/websocketData", {}, { "x-steadfast-internal-token": internalToken });
+  assert.deepEqual(credentials.body, { usersession: "server-session", userid: "server-user" });
 });

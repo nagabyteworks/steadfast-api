@@ -10,6 +10,7 @@ const shoonyaRoutes = require("./routes/shoonya");
 const virtualRoutes = require("./routes/virtual");
 const fileUpdates = require('./routes/fileUpdates');
 const requireAllowedOrigin = require("./middleware/requireAllowedOrigin");
+const { createSessionStore } = require("./sessionStore");
 
 const app = express();
 
@@ -33,6 +34,29 @@ let storedCredentials = {
   flattrade: { usersession: "", userid: "" },
   shoonya: { usersession: "", userid: "" },
 };
+const sessionStore = config.environment === "production"
+  ? createSessionStore(process.env.STATE_DIRECTORY || "/var/lib/steadfast-api", process.env.FLATTRADE_CLIENT_ID, async () => {
+      await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
+    })
+  : null;
+
+// Restore the persisted Flattrade token so a restart does not require a new login.
+function restoreStoredSession() {
+  if (!sessionStore) return null;
+  try {
+    const session = sessionStore.get();
+    if (session.usersession) {
+      storedCredentials.flattrade = { usersession: session.usersession, userid: session.userid };
+      console.log("Restored Flattrade session from the database");
+      return session;
+    }
+    console.log("No valid Flattrade session found in the database; login required");
+  } catch (error) {
+    console.error("Unable to read the stored Flattrade session", { code: error.code });
+  }
+  return null;
+}
+const restoredSession = restoreStoredSession();
 
 let selectedBroker = "";
 const pythonServerPort = 5000; // Choose an available port
@@ -42,7 +66,7 @@ app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, a
   if (config.environment === "production" || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}));
+}, undefined, sessionStore));
 if (config.environment === "production") {
   app.use("/shoonya", (req, res) => {
     res.status(503).json({ message: "Shoonya is unavailable in production until server-managed sessions are implemented" });
@@ -131,6 +155,11 @@ app.use((err, req, res, next) => {
 
 app.listen(config.port, config.host, () => {
   console.log(`Server is running on http://${config.host}:${config.port}`);
+  if (restoredSession) {
+    sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true }).catch((error) => {
+      console.error("Unable to restart Flattrade streaming with the restored session:", error.message);
+    });
+  }
 });
 
 // Code To Download Updated Instrument files everyday after 7am IST(1:30am UTC). 

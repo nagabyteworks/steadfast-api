@@ -37,3 +37,14 @@ test("invalid rules are rejected", () => {
   assert.equal(validateRule("X", input({ slPrice: null })).slPrice, null);
   assert.throws(() => validateRule("X", input({ instrument: "bad" })), /Invalid instrument/);
 });
+
+test("each mode validates its own required fields", () => {
+  const stat = validateRule("X", input({ mode: "static", trailPoints: null }));
+  assert.equal(stat.mode, "static");
+  assert.throws(() => validateRule("X", input({ mode: "trailing_sl", slPoints: null })), /./);
+  assert.throws(() => validateRule("X", input({ mode: "trailing_sl", slPrice: null, slPoints: 10 })), /./);
+  assert.throws(() => validateRule("X", input({ mode: "target_trail", targetPrice: null })), /./);
+  assert.throws(() => validateRule("X", input({ side: "short", slPrice: 90, targetPrice: 95 })), /./);
+  const short = validateRule("X", input({ side: "short", slPrice: 110, targetPrice: 80 }));
+  assert.equal(short.side, "short");
+});

@@ -529,11 +529,18 @@ module.exports = (
       );
       res.json(response.data);
     } catch (error) {
-      res.status(500).json({
-        message: "Error placing Flattrade Place order",
-        error: error.message,
+      const brokerResponse = error.response?.data;
+      const brokerMessage = brokerResponse?.stat === "Not_Ok" &&
+        typeof brokerResponse.emsg === "string" && brokerResponse.emsg.trim()
+        ? brokerResponse.emsg.split(jKey).join("[redacted]").slice(0, 500)
+        : null;
+      const rejected = error.response?.status >= 400 && error.response.status < 500 && brokerMessage;
+      console.error("Error placing Flattrade order", { code: error.code, status: error.response?.status });
+      res.status(502).json({
+        message: rejected
+          ? `Flattrade rejected the order: ${brokerMessage}`
+          : "Order status is uncertain. Verify orders with Flattrade before retrying.",
       });
-      console.error("Error placing Flattrade Place order:", error.message);
     }
   });
 

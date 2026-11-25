@@ -239,4 +239,23 @@ test("production Flattrade accepts only NFO orders no larger than one lot", asyn
   assert.match(calls[0].body, /server-session/);
   assert.match(calls[0].body, /server-user/);
   assert.doesNotMatch(calls[0].body, /injected-user/);
+
+  axios.post = async () => {
+    throw {
+      response: { status: 400, data: { stat: "Not_Ok", emsg: "Rejected: insufficient funds" } },
+    };
+  };
+  const rejected = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
+  assert.equal(rejected.status, 502);
+  assert.equal(rejected.body.message, "Flattrade rejected the order: Rejected: insufficient funds");
+
+  axios.post = async () => {
+    throw { response: { status: 400, data: { stat: "Not_Ok", emsg: "Invalid server-session" } } };
+  };
+  const redacted = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
+  assert.doesNotMatch(redacted.body.message, /server-session/);
+
+  axios.post = async () => { throw new Error("network failure"); };
+  const uncertain = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
+  assert.match(uncertain.body.message, /uncertain.*before retrying/i);
 });

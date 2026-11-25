@@ -43,3 +43,6 @@ coverage
 !*.csv
 !*.zip
 package-lock.json
+
+# Local Flattrade token database
+data/

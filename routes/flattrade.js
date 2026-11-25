@@ -10,6 +10,7 @@ const { parse, isBefore } = require("date-fns");
 const { createHash } = require("crypto");
 const requireTradingEnabled = require("../middleware/requireTradingEnabled");
 const requireInternalToken = require("../middleware/requireInternalToken");
+const createRiskRouter = require("./risk");
 
 const symbolCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
 const lotSizeCache = new NodeCache({ stdTTL: 4 * 60 * 60 });
@@ -62,7 +63,9 @@ module.exports = (
     process.env.FLATTRADE_CLIENT_ID &&
     process.env.FLATTRADE_API_KEY &&
     process.env.FLATTRADE_API_SECRET
-  )
+  ),
+  riskStore = null,
+  dryRun = true
 ) => {
   const router = express.Router();
   const production = environment === "production";
@@ -76,6 +79,10 @@ module.exports = (
         usersession: req.query.FLATTRADE_API_TOKEN || req.headers.authorization?.split(" ")[1],
         userid: req.query.FLATTRADE_CLIENT_ID,
       };
+
+  if (riskStore && serverManagedAccount) {
+    router.use("/risk", createRiskRouter({ store: riskStore, getSession: getStoredSession, internalToken, dryRun }));
+  }
 
   const configuredAccount = () => ({
     apiKey: process.env.FLATTRADE_API_KEY,

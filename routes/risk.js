@@ -65,7 +65,10 @@ async function submitExit(session, position, ltp) {
   const { data } = await axios.post(`${BROKER}/PlaceOrder`, `jData=${JSON.stringify(order)}&jKey=${session.usersession}`,
     { headers: FORM, timeout: 10000 });
   if (data?.stat !== "Ok") throw new Error("Flattrade rejected the exit order");
-  return order;
+  if (typeof data.norenordno !== "string" || !data.norenordno) {
+    throw new Error("Position needs reconciliation: broker accepted the exit without an order ID");
+  }
+  return data.norenordno;
 }
 
 module.exports = ({ store, getSession, internalToken, tradingEnabled = () => process.env.TRADING_ENABLED === "true",
@@ -208,12 +211,22 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
 
   const trigger = (monitor) => async (req, res) => {
     const { tsym, reason, ltp, rev } = req.body || {};
-    if (typeof tsym !== "string" || typeof reason !== "string" || !Number.isSafeInteger(rev)) {
+    if (typeof tsym !== "string" || !["Stop-loss", "Target"].includes(reason) ||
+        typeof ltp !== "number" || !Number.isFinite(ltp) || ltp <= 0 ||
+        !Number.isSafeInteger(rev)) {
       return res.status(400).json({ message: "Invalid trigger" });
     }
     const rule = store.get(tsym);
     if (rule?.monitor !== monitor || rev !== rule.rev) {
       return noStore(res).json({ handled: false });
+    }
+    const sign = rule.side === "long" ? 1 : -1;
+    const crossed = reason === "Stop-loss"
+      ? rule.slPrice !== null && sign * (ltp - rule.slPrice) <= 0
+      : rule.mode !== "target_trail" && rule.targetPrice !== null &&
+        sign * (ltp - rule.targetPrice) >= 0;
+    if (!crossed) {
+      return res.status(409).json({ message: "Trigger price has not crossed the configured protection level" });
     }
     if (!store.claim(tsym)) {
       console.log(`Risk trigger for ${tsym} ignored: rule is not armed (already handled or removed)`);
@@ -241,10 +254,16 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
       if (!store.canSubmit(tsym, claimedRev)) {
         return noStore(res).json({ handled: false, status: "reconciliation_required" });
       }
-      await submitExit(session, position, ltp);
-      console.log(`Risk exit submitted for ${tsym}`);
-      store.finish(tsym, "done", `${note}: exit order submitted`);
-      noStore(res).json({ handled: true, status: "done" });
+      const brokerOrderId = await submitExit(session, position, ltp);
+      console.log(`Risk exit accepted for ${tsym}; awaiting fill confirmation`);
+      if (!store.finish(tsym, "exit_pending",
+        `${note}: Flattrade accepted exit order ${brokerOrderId}; execution is unconfirmed`)) {
+        const message = `Position needs reconciliation: Flattrade accepted exit order ${brokerOrderId}, but exit state changed before it could be recorded`;
+        store.markReconciliationRequired(session.userid, tsym, claimedRev, message);
+        noStore(res).json({ handled: true, status: "reconciliation_required", brokerOrderId });
+        return;
+      }
+      noStore(res).json({ handled: true, status: "exit_pending", brokerOrderId });
     } catch (error) {
       console.error("Risk exit failed", { tsym, code: error.code, status: error.response?.status });
       try {
@@ -261,7 +280,8 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
     }
   };
   router.post("/internal/trigger", internal, trigger("server"));
-  router.post("/trigger", trigger("ui"));
+  router.post("/trigger", (_req, res) =>
+    res.status(410).json({ message: "Browser-triggered risk execution is disabled" }));
 
   return router;
 };

@@ -26,8 +26,8 @@ test("a rule can be claimed once and progress is ignored after a user edit", (t)
   assert.equal(store.claim("NIFTYCE"), true);
   assert.equal(store.claim("NIFTYCE"), false);
   assert.equal(store.updateProgress("NIFTYCE", edited, 100, 130), false);
-  assert.equal(store.finish("NIFTYCE", "done", "ok"), true);
-  assert.equal(store.list()[0].status, "done");
+  assert.equal(store.finish("NIFTYCE", "exit_pending", "awaiting fill confirmation"), true);
+  assert.equal(store.list()[0].status, "exit_pending");
 });
 
 test("invalid rules are rejected", () => {
@@ -57,7 +57,7 @@ test("exit orders are limit prices through the market because Flattrade rejects 
   assert.throws(() => marketableLimitPrice(undefined, true), /live price/);
 });
 
-test("rules default to server monitoring and persist the monitor choice", (t) => {
+test("rules accept server monitoring only", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const store = createRiskStore(directory);
@@ -65,8 +65,39 @@ test("rules default to server monitoring and persist the monitor choice", (t) =>
 
   assert.equal(validateRule("X", input()).monitor, "server");
   assert.throws(() => validateRule("X", input({ monitor: "phone" })), /Invalid monitor/);
-  store.save(validateRule("UI1", input({ monitor: "ui" })));
+  assert.throws(() => validateRule("UI1", input({ monitor: "ui" })), /Invalid monitor/);
   store.save(validateRule("SRV1", input()));
   const monitors = Object.fromEntries(store.list().map((rule) => [rule.tsym, rule.monitor]));
-  assert.deepEqual(monitors, { SRV1: "server", UI1: "ui" });
+  assert.deepEqual(monitors, { SRV1: "server" });
+});
+
+test("legacy UI-monitored rules migrate to server monitoring", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-migration-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let store = createRiskStore(directory);
+  store.save(validateRule("LEGACY", input()));
+  store.close();
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(path.join(directory, "risk-rules.sqlite"));
+  db.prepare("UPDATE risk_rule SET monitor = 'ui' WHERE tsym = ?").run("LEGACY");
+  db.close();
+  store = createRiskStore(directory);
+  t.after(() => store.close());
+  assert.equal(store.get("LEGACY").monitor, "server");
+});
+
+test("startup flags pending broker exits for reconciliation", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-exit-recovery-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let store = createRiskStore(directory);
+  store.save(validateRule("PENDING", input({ mode: "static", targetPrice: null, trailPoints: null })));
+  assert.equal(store.claim("PENDING"), true);
+  assert.equal(store.finish("PENDING", "exit_pending", "broker order accepted; fill unknown"), true);
+  store.close();
+  store = createRiskStore(directory);
+  t.after(() => store.close());
+  store.suspendOnStartup("test");
+  assert.equal(store.get("PENDING").status, "reconciliation_required");
+  assert.equal(store.listReconciliation("test")[0].tsym, "PENDING");
+  assert.match(store.listReconciliation("test")[0].message, /broker order accepted; fill unknown/);
 });

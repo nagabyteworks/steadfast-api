@@ -3,7 +3,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { nextExpiry } = require("./sessionStore");
 
-const MONITORS = new Set(["server", "ui"]);
+const MONITORS = new Set(["server"]);
 const MODES = new Set(["static", "trailing_sl", "target_trail"]);
 const COLUMNS = "tsym, instrument, side, entry, mode, sl_price, sl_points, target_price, trail_points, status, message, rev, expires_at, updated_at, monitor";
 
@@ -84,6 +84,7 @@ function createRiskStore(directory) {
   if (!db.prepare("PRAGMA table_info(risk_rule)").all().some((column) => column.name === "monitor")) {
     db.exec("ALTER TABLE risk_rule ADD COLUMN monitor TEXT NOT NULL DEFAULT 'server'");
   }
+  db.exec("UPDATE risk_rule SET monitor = 'server' WHERE monitor <> 'server'");
 
   const selectAll = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE expires_at > ? ORDER BY tsym`);
   const selectOne = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE tsym = ? AND expires_at > ?`);
@@ -106,7 +107,8 @@ function createRiskStore(directory) {
   const reconciliation = db.prepare("SELECT 1 FROM risk_reconciliation WHERE tsym = ? LIMIT 1");
   const reconciliationList = db.prepare("SELECT tsym, reason, updated_at FROM risk_reconciliation WHERE account = ? OR account = '' ORDER BY updated_at");
   const suspendRule = db.prepare(`UPDATE risk_rule SET status = 'reconciliation_required', message = ?, rev = rev + 1,
-    updated_at = ? WHERE tsym = ? AND status IN ('armed', 'triggered', 'reconciliation_in_progress')`);
+    updated_at = ? WHERE tsym = ? AND status IN ('armed', 'triggered', 'exit_pending',
+      'exit_partially_filled', 'reconciliation_in_progress')`);
   const begin = db.prepare(`UPDATE risk_rule SET status = 'reconciliation_in_progress', rev = rev + 1, updated_at = ?
     WHERE tsym = ? AND status = 'armed'`);
   const sameOpening = (previous, product, opening, rule) => previous &&
@@ -246,8 +248,11 @@ function createRiskStore(directory) {
     },
     suspendAll(account, reason) {
       for (const rule of this.list()) {
-        if (["armed", "triggered", "reconciliation_in_progress"].includes(rule.status)) {
-          this.markReconciliationRequired(account, rule.tsym, rule.rev, reason);
+        if (["armed", "triggered", "exit_pending", "exit_partially_filled",
+          "reconciliation_in_progress"].includes(rule.status)) {
+          const pendingExit = ["exit_pending", "exit_partially_filled"].includes(rule.status);
+          const detail = pendingExit && rule.message ? `${reason}; ${rule.message}` : reason;
+          this.markReconciliationRequired(account, rule.tsym, rule.rev, detail);
         }
       }
     },

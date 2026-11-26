@@ -62,7 +62,7 @@ test("startup suspends persisted rules and neither UI nor server triggers submit
     assert.equal((await dispatch(router, "POST", "/internal/trigger",
       { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 }, internal)).body.handled, false);
     assert.equal((await dispatch(router, "POST", "/trigger",
-      { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 })).body.handled, false);
+      { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 })).status, 410);
   }
   assert.equal(calls, 0);
   assert.equal(store.get("NIFTYCE").status, "reconciliation_required");
@@ -250,10 +250,12 @@ test("a server trigger sends one exit for the open quantity and never retries", 
     calls.push({ url, body });
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
-    return { data: { stat: "Ok" } };
+    return { data: { stat: "Ok", norenordno: "exit-1" } };
   };
   const trigger = { tsym: "NIFTYCE", reason: "Stop-loss", ltp: 140, rev: 1 };
-  assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.status, "done");
+  assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.status, "exit_pending");
+  assert.equal(store.get("NIFTYCE").status, "exit_pending");
+  assert.match(store.get("NIFTYCE").message, /exit-1.*execution is unconfirmed/);
   assert.match(calls[3].body, /"trantype":"S"/);
   assert.match(calls[3].body, /"qty":"75"/);
   assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.handled, false);
@@ -288,17 +290,49 @@ test("a rejected exit requires reconciliation and is not retried", async (t) => 
   assert.equal(calls, 4);
 });
 
-test("UI rules are not handed to or triggered by the server", async (t) => {
-  const { router, store } = setup(t);
-  store.save({ ...rule, tsym: "NIFTYCE", monitor: "ui" });
-  assert.deepEqual((await dispatch(router, "GET", "/internal/rules", {}, internal)).body.rules, []);
-  assert.equal((await dispatch(router, "POST", "/internal/trigger", { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 }, internal)).body.handled, false);
-  assert.equal(store.get("NIFTYCE").status, "armed");
+test("an accepted exit without a broker order ID is uncertain, not complete", async (t) => {
+  const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
+  seed(store);
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  axios.post = async (url) => {
+    if (url.endsWith("/PositionBook")) return { data: [livePosition] };
+    if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    return { data: { stat: "Ok" } };
+  };
+  const result = await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Stop-loss", ltp: 140, rev: 1 }, internal);
+  assert.equal(result.body.status, "reconciliation_required");
+  assert.notEqual(store.get("NIFTYCE").status, "done");
 });
 
-test("UI automatic exits require the current revision and backend reconciliation", async (t) => {
+test("an accepted exit is flagged when its lifecycle changes during submission", async (t) => {
   const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
-  seed(store, { monitor: "ui" });
+  seed(store);
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  axios.post = async (url) => {
+    if (url.endsWith("/PositionBook")) return { data: [livePosition] };
+    if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    store.markReconciliationRequired("test", "NIFTYCE", 1, "Position needs reconciliation: changed");
+    return { data: { stat: "Ok", norenordno: "exit-race" } };
+  };
+  const result = await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Stop-loss", ltp: 140, rev: 1 }, internal);
+  assert.equal(result.body.status, "reconciliation_required");
+  assert.match(store.listReconciliation("test")[0].message, /exit-race/);
+});
+
+test("browser-triggered automatic exits are disabled", async (t) => {
+  const { router, store } = setup(t);
+  assert.equal((await dispatch(router, "POST", "/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 })).status, 410);
+  assert.equal(store.get("NIFTYCE"), null);
+});
+
+test("risk triggers require a finite positive price that crossed the configured level", async (t) => {
+  const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
+  seed(store);
   const originalPost = axios.post;
   t.after(() => { axios.post = originalPost; });
   const calls = [];
@@ -306,13 +340,18 @@ test("UI automatic exits require the current revision and backend reconciliation
     calls.push(url);
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
-    return { data: { stat: "Ok" } };
+    return { data: { stat: "Ok", norenordno: "exit-2" } };
   };
-  assert.equal((await dispatch(router, "POST", "/trigger",
-    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 99 })).body.handled, false);
+  assert.equal((await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 99 }, internal)).body.handled, false);
   assert.equal(calls.length, 0);
-  assert.equal((await dispatch(router, "POST", "/trigger",
-    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 })).body.status, "done");
+  assert.equal((await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 0, rev: 1 }, internal)).status, 400);
+  assert.equal((await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 150, rev: 1 }, internal)).status, 409);
+  assert.equal(store.get("NIFTYCE").status, "armed");
+  assert.equal((await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 }, internal)).body.status, "exit_pending");
   assert.equal(calls.filter((url) => url.endsWith("/PlaceOrder")).length, 1);
 });
 
@@ -351,6 +390,8 @@ test("malformed triggers are rejected without claiming a rule", async (t) => {
   const { router, store } = setup(t);
   store.save({ ...rule, tsym: "NIFTYCE" });
   assert.equal((await dispatch(router, "POST", "/internal/trigger", { tsym: "NIFTYCE" }, internal)).status, 400);
+  assert.equal((await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Stop-loss", ltp: "140", rev: 1 }, internal)).status, 400);
   assert.equal(store.get("NIFTYCE").status, "armed");
 });
 

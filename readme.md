@@ -10,7 +10,7 @@ npm run dev
 
 The application will be available at http://localhost:3000.
 
-[Link to monorepo](https://github.com/narenkram/steadfast-monorepo)
+[Link to monorepo](https://github.com/nagabyteworks/steadfast-monorepo)
 
 # Join Our Telegram Channel
 

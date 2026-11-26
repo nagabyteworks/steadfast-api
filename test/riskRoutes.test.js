@@ -44,7 +44,7 @@ const seed = (store, overrides = {}) => store.saveDefault("test", "M", {
   openingOrderId: "1", openingFillId: "1", openingPrice: 150,
 }, { ...rule, tsym: "NIFTYCE", ...overrides }, null);
 
-test("startup suspends persisted rules and neither UI nor server triggers submit an order", async (t) => {
+test("startup suspends persisted rules and rejects triggers from the wrong monitor", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-startup-risk-"));
   let store = createRiskStore(directory);
   t.after(() => { store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
@@ -62,7 +62,7 @@ test("startup suspends persisted rules and neither UI nor server triggers submit
     assert.equal((await dispatch(router, "POST", "/internal/trigger",
       { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 }, internal)).body.handled, false);
     assert.equal((await dispatch(router, "POST", "/trigger",
-      { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 })).status, 410);
+      { tsym: "NIFTYCE", reason, ltp: 140, rev: 1 })).body.handled, false);
   }
   assert.equal(calls, 0);
   assert.equal(store.get("NIFTYCE").status, "reconciliation_required");
@@ -150,6 +150,18 @@ test("rule endpoints validate, update, list and delete protection", async (t) =>
   assert.equal((await dispatch(router, "GET", "/rules")).body.rules.length, 1);
   assert.equal((await dispatch(router, "DELETE", "/rules/NIFTYCE")).status, 200);
   assert.equal((await dispatch(router, "GET", "/rules")).body.rules.length, 0);
+});
+
+test("UI trailing progress rejects stale revisions", async (t) => {
+  const { router, store } = setup(t);
+  seed(store, { mode: "trailing_sl" });
+  const stale = await dispatch(router, "PATCH", "/rules/NIFTYCE", { slPrice: 145, rev: 99 });
+  assert.equal(stale.status, 409);
+  assert.equal(store.get("NIFTYCE").slPrice, 140);
+  const updated = await dispatch(router, "PATCH", "/rules/NIFTYCE", { slPrice: 145, rev: 1 });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.slPrice, 145);
+  assert.equal(updated.body.rev, 2);
 });
 
 test("manual protection uses reconciled fills and discards a stale lifecycle", async (t) => {
@@ -323,11 +335,24 @@ test("an accepted exit is flagged when its lifecycle changes during submission",
   assert.match(store.listReconciliation("test")[0].message, /exit-race/);
 });
 
-test("browser-triggered automatic exits are disabled", async (t) => {
-  const { router, store } = setup(t);
-  assert.equal((await dispatch(router, "POST", "/trigger",
-    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 })).status, 410);
-  assert.equal(store.get("NIFTYCE"), null);
+test("UI-monitored triggers use the API-owned broker exit flow", async (t) => {
+  const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
+  seed(store, { monitor: "ui" });
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  const calls = [];
+  axios.post = async (url) => {
+    calls.push(url);
+    if (url.endsWith("/PositionBook")) return { data: [livePosition] };
+    if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    return { data: { stat: "Ok", norenordno: "ui-exit" } };
+  };
+  const result = await dispatch(router, "POST", "/trigger",
+    { tsym: "NIFTYCE", reason: "Target", ltp: 170, rev: 1 });
+  assert.equal(result.body.status, "exit_pending");
+  assert.ok(calls.some((url) => url.endsWith("/PlaceOrder")));
+  assert.equal(store.get("NIFTYCE").monitor, "ui");
+  assert.equal(store.get("NIFTYCE").status, "exit_pending");
 });
 
 test("risk triggers require a finite positive price that crossed the configured level", async (t) => {

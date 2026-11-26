@@ -57,7 +57,7 @@ test("exit orders are limit prices through the market because Flattrade rejects 
   assert.throws(() => marketableLimitPrice(undefined, true), /live price/);
 });
 
-test("rules accept server monitoring only", (t) => {
+test("rules accept and persist server or UI monitoring", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const store = createRiskStore(directory);
@@ -65,25 +65,21 @@ test("rules accept server monitoring only", (t) => {
 
   assert.equal(validateRule("X", input()).monitor, "server");
   assert.throws(() => validateRule("X", input({ monitor: "phone" })), /Invalid monitor/);
-  assert.throws(() => validateRule("UI1", input({ monitor: "ui" })), /Invalid monitor/);
   store.save(validateRule("SRV1", input()));
+  store.save(validateRule("UI1", input({ monitor: "ui" })));
   const monitors = Object.fromEntries(store.list().map((rule) => [rule.tsym, rule.monitor]));
-  assert.deepEqual(monitors, { SRV1: "server" });
+  assert.deepEqual(monitors, { SRV1: "server", UI1: "ui" });
 });
 
-test("legacy UI-monitored rules migrate to server monitoring", (t) => {
+test("UI monitoring selection persists across API restarts", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-migration-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   let store = createRiskStore(directory);
-  store.save(validateRule("LEGACY", input()));
+  store.save(validateRule("UI1", input({ monitor: "ui" })));
   store.close();
-  const { DatabaseSync } = require("node:sqlite");
-  const db = new DatabaseSync(path.join(directory, "risk-rules.sqlite"));
-  db.prepare("UPDATE risk_rule SET monitor = 'ui' WHERE tsym = ?").run("LEGACY");
-  db.close();
   store = createRiskStore(directory);
   t.after(() => store.close());
-  assert.equal(store.get("LEGACY").monitor, "server");
+  assert.equal(store.get("UI1").monitor, "ui");
 });
 
 test("startup flags pending broker exits for reconciliation", (t) => {

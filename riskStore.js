@@ -3,7 +3,7 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { nextExpiry } = require("./sessionStore");
 
-const MONITORS = new Set(["server"]);
+const MONITORS = new Set(["server", "ui"]);
 const MODES = new Set(["static", "trailing_sl", "target_trail"]);
 const COLUMNS = "tsym, instrument, side, entry, mode, sl_price, sl_points, target_price, trail_points, status, message, rev, expires_at, updated_at, monitor";
 
@@ -84,8 +84,6 @@ function createRiskStore(directory) {
   if (!db.prepare("PRAGMA table_info(risk_rule)").all().some((column) => column.name === "monitor")) {
     db.exec("ALTER TABLE risk_rule ADD COLUMN monitor TEXT NOT NULL DEFAULT 'server'");
   }
-  db.exec("UPDATE risk_rule SET monitor = 'server' WHERE monitor <> 'server'");
-
   const selectAll = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE expires_at > ? ORDER BY tsym`);
   const selectOne = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE tsym = ? AND expires_at > ?`);
   const selectRev = db.prepare("SELECT rev FROM risk_rule WHERE tsym = ?");

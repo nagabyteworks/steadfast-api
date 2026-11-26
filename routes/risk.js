@@ -172,6 +172,9 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
       const existing = store.get(req.params.tsym);
       if (!existing || existing.status !== "armed") return res.status(404).json({ message: "No armed rule for this position" });
       const patch = req.body || {};
+      if ("rev" in patch && (!Number.isSafeInteger(patch.rev) || patch.rev !== existing.rev)) {
+        return res.status(409).json({ message: "Risk rule revision changed; refresh before updating it" });
+      }
       const merged = { ...existing };
       for (const field of ["monitor", "mode", "slPrice", "slPoints", "targetPrice", "trailPoints"]) {
         if (field in patch) merged[field] = patch[field];
@@ -280,8 +283,7 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
     }
   };
   router.post("/internal/trigger", internal, trigger("server"));
-  router.post("/trigger", (_req, res) =>
-    res.status(410).json({ message: "Browser-triggered risk execution is disabled" }));
+  router.post("/trigger", trigger("ui"));
 
   return router;
 };

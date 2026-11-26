@@ -2,17 +2,39 @@ const express = require("express");
 const axios = require("axios");
 const requireInternalToken = require("../middleware/requireInternalToken");
 const { validateRule } = require("../riskStore");
+const { reconstructOpeningFill } = require("../positionLifecycle");
 
 const BROKER = "https://piconnect.flattrade.in/PiConnectAPI";
 const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
 const encodeSymbol = (tsym) => encodeURIComponent(tsym).replace(/%20/g, "+")
   .replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
 
-async function findOpenPosition(session, tsym) {
+async function reconcilePosition(session, tsym, tradingDay) {
   const payload = `jKey=${session.usersession}&jData=${JSON.stringify({ uid: session.userid, actid: session.userid })}`;
-  const { data } = await axios.post(`${BROKER}/PositionBook`, payload, { headers: FORM, timeout: 10000 });
-  if (!Array.isArray(data)) return null;
-  return data.find((position) => position.tsym === tsym && Number(position.netqty) !== 0) || null;
+  const request = (name) => axios.post(`${BROKER}/${name}`, payload, { headers: FORM, timeout: 10000 });
+  const before = (await request("PositionBook")).data;
+  const trades = (await request("TradeBook")).data;
+  const after = (await request("PositionBook")).data;
+  const find = (book) => {
+    if (!Array.isArray(book)) throw new Error("Position needs reconciliation: broker position book unavailable");
+    const matching = book.filter((item) => item?.tsym === tsym);
+    if (matching.length > 1) throw new Error("Position needs reconciliation: duplicate position records");
+    if (matching.some((item) => !/^-?\d+$/.test(String(item.netqty)))) {
+      throw new Error("Position needs reconciliation: invalid position quantity");
+    }
+    const open = matching.filter((item) => Number(item.netqty) !== 0);
+    if (open.length !== 1) throw new Error("Position needs reconciliation: no unique open position");
+    return open[0];
+  };
+  const first = find(before);
+  const position = find(after);
+  const fields = ["exch", "prd", "token", "netqty", "daybuyqty", "daysellqty", "cfbuyqty", "cfsellqty"];
+  if (fields.some((field) => first[field] !== position[field])) {
+    throw new Error("Position needs reconciliation: position changed during refresh");
+  }
+  const opening = reconstructOpeningFill(position, trades, tradingDay);
+  if (opening.status !== "open") throw new Error("Position needs reconciliation: position is flat");
+  return { position, opening };
 }
 
 // Flattrade rejects MKT orders from the API ("ALGO_CHK"), so exits are limit orders priced
@@ -46,23 +68,99 @@ async function submitExit(session, position, ltp) {
   return order;
 }
 
-module.exports = ({ store, getSession, internalToken, tradingEnabled = () => process.env.TRADING_ENABLED === "true" }) => {
+module.exports = ({ store, getSession, internalToken, tradingEnabled = () => process.env.TRADING_ENABLED === "true",
+  tradingDay = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date()) }) => {
   const router = express.Router();
   const internal = requireInternalToken(internalToken);
   const noStore = (res) => res.set("Cache-Control", "no-store");
 
-  router.get("/rules", (req, res) => noStore(res).json({ rules: store.list() }));
-
-  router.put("/rules/:tsym", (req, res) => {
+  router.get("/rules", (req, res) => {
     try {
-      const rule = validateRule(req.params.tsym, req.body);
-      const rev = store.save(rule);
-      console.log(`Risk rule saved: ${rule.tsym} monitor=${rule.monitor} mode=${rule.mode} sl=${rule.slPrice} target=${rule.targetPrice} trail=${rule.trailPoints} rev=${rev}`);
-      noStore(res).json({ ...rule, status: "armed", rev });
+      const session = getSession();
+      if (!session?.usersession || !session.userid) {
+        store.suspendAll(session?.userid || "", "Position needs reconciliation: Flattrade session is unavailable");
+      }
+      return noStore(res).json({ rules: store.list(), reconciliation: store.listReconciliation(session?.userid || null) });
     } catch (error) {
-      res.status(error.status || 500).json({ message: error.status ? error.message : "Unable to save the rule" });
+      console.error("Unable to load risk rules", { code: error.code });
+      try {
+        store.suspendAll("", "Position needs reconciliation: broker session or risk state is unavailable");
+      } catch (suspendError) {
+        console.error("Unable to suspend risk rules", { code: suspendError.code });
+      }
+      return res.status(503).json({ message: "Unable to load risk rules" });
     }
   });
+
+  router.post("/rules/:tsym/:operation(default|manual)", async (req, res) => {
+    const { stopPoints, targetPoints, trailPoints, trailingStop, targetTrailing, monitor, kind } = req.body || {};
+    const manual = req.params.operation === "manual";
+    const isPositive = (value) => typeof value === "number" && Number.isFinite(value) && value > 0;
+    if ((stopPoints !== null && !isPositive(stopPoints)) || (targetPoints !== null && !isPositive(targetPoints)) ||
+        (stopPoints === null && targetPoints === null) || typeof trailingStop !== "boolean" ||
+        typeof targetTrailing !== "boolean" || (trailingStop && (stopPoints === null || targetTrailing)) ||
+        (targetTrailing && ((!manual && stopPoints === null) || targetPoints === null || !isPositive(trailPoints))) ||
+        (manual && !((kind === "stop" && stopPoints !== null && targetPoints === null) ||
+          (kind === "target" && stopPoints === null && targetPoints !== null))) ||
+        (!targetTrailing && trailPoints !== null) || !["server", "ui"].includes(monitor)) {
+      return res.status(400).json({ message: "Invalid default protection configuration" });
+    }
+    let expectedRev;
+    try {
+      expectedRev = store.beginReconciliation(req.params.tsym);
+    } catch (error) {
+      return res.status(error.status || 503).json({ message: error.status ? error.message : "Unable to suspend protection for reconciliation" });
+    }
+    const failReconciliation = (account, reason, status = 409) => {
+      try {
+        store.markReconciliationRequired(account, req.params.tsym, expectedRev, reason);
+      } catch (error) {
+        console.error("Unable to persist reconciliation status", { tsym: req.params.tsym, code: error.code });
+        return res.status(503).json({ message: "Unable to persist reconciliation status; verify protection manually" });
+      }
+      return res.status(status).json({ status: "RECONCILIATION_REQUIRED",
+        message: `${reason}; previous protection is suspended if present; verify the position and protection with Flattrade` });
+    };
+    let session;
+    try {
+      session = getSession();
+    } catch (error) {
+      console.error("Unable to read Flattrade session for reconciliation", { code: error.code });
+      return failReconciliation("", "Position needs reconciliation: Flattrade session is unavailable", 503);
+    }
+    if (!session?.usersession || !session.userid) {
+      return failReconciliation(session?.userid || "", "Position needs reconciliation: Flattrade session is unavailable", 503);
+    }
+    try {
+      const { position, opening } = await reconcilePosition(session, req.params.tsym, tradingDay());
+      const sign = opening.side === "long" ? 1 : -1;
+      const round = (value) => Number(value.toFixed(2));
+      const rule = validateRule(req.params.tsym, {
+        instrument: `${position.exch}|${position.token}`, side: opening.side, entry: opening.openingPrice,
+        mode: targetTrailing ? "target_trail" : trailingStop ? "trailing_sl" : "static",
+        slPrice: stopPoints === null ? null : round(opening.openingPrice - sign * stopPoints),
+        slPoints: stopPoints, targetPrice: targetPoints === null ? null : round(opening.openingPrice + sign * targetPoints),
+        trailPoints: targetTrailing ? trailPoints : null, monitor,
+      });
+      noStore(res).json(manual
+        ? store.saveManual(session.userid, position.prd, opening, rule, expectedRev, kind)
+        : store.saveDefault(session.userid, position.prd, opening, rule, expectedRev));
+    } catch (error) {
+      console.error("Default protection reconciliation failed", { tsym: req.params.tsym, code: error.code });
+      if (error.code === "RECONCILIATION_REQUIRED") {
+        return res.status(409).json({ status: error.code, message: error.message });
+      }
+      const reason = error.message.startsWith("Position needs reconciliation:") ? error.message
+        : error.code === "ECONNABORTED" || error.code === "ETIMEDOUT"
+          ? "Position needs reconciliation: broker request timed out"
+          : "Position needs reconciliation: broker request failed or protection could not be verified";
+      return failReconciliation(session.userid, reason,
+        error.status || (error.message.startsWith("Position needs reconciliation:") ? 409 : 502));
+    }
+  });
+
+  router.put("/rules/:tsym", (req, res) =>
+    res.status(409).json({ message: "Create protection using reconciled default or manual rules" }));
 
   // Partial edit applied to the latest stored state, so a trailing stop that moved since the
   // browser last refreshed is never overwritten by a stale value.
@@ -108,49 +206,62 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
     noStore(res).json({ applied });
   });
 
-  router.post("/internal/trigger", internal, async (req, res) => {
-    const { tsym, reason, ltp } = req.body || {};
-    if (typeof tsym !== "string" || typeof reason !== "string") {
+  const trigger = (monitor) => async (req, res) => {
+    const { tsym, reason, ltp, rev } = req.body || {};
+    if (typeof tsym !== "string" || typeof reason !== "string" || !Number.isSafeInteger(rev)) {
       return res.status(400).json({ message: "Invalid trigger" });
     }
-    if (store.get(tsym)?.monitor === "ui") {
-      console.log(`Risk trigger for ${tsym} ignored: the rule is monitored by the app`);
+    const rule = store.get(tsym);
+    if (rule?.monitor !== monitor || rev !== rule.rev) {
       return noStore(res).json({ handled: false });
     }
     if (!store.claim(tsym)) {
       console.log(`Risk trigger for ${tsym} ignored: rule is not armed (already handled or removed)`);
       return noStore(res).json({ handled: false });
     }
+    const claimedRev = store.get(tsym)?.rev;
 
     const note = `${reason.slice(0, 40)} at ${Number(ltp)}`;
     console.log(`Risk trigger received for ${tsym}: ${note}`);
     try {
       const session = getSession();
-      if (!session.usersession) {
-        store.finish(tsym, "failed", `${note}: no broker session`);
-        return noStore(res).json({ handled: true, status: "failed" });
+      if (!session?.usersession || !session.userid) {
+        store.markReconciliationRequired(session?.userid || "", tsym, claimedRev,
+          "Position needs reconciliation: Flattrade session is unavailable");
+        return noStore(res).json({ handled: true, status: "reconciliation_required" });
       }
-      const position = await findOpenPosition(session, tsym);
-      if (!position) {
-        store.finish(tsym, "cancelled", `${note}: no open position`);
-        return noStore(res).json({ handled: true, status: "cancelled" });
+      const { position, opening } = await reconcilePosition(session, tsym, tradingDay());
+      if (!store.matchesLifecycle(session.userid, position, opening, rule)) {
+        throw new Error("Position needs reconciliation: opening fill does not match the stored lifecycle");
       }
-      const side = Number(position.netqty) > 0 ? "SELL" : "BUY";
       if (!tradingEnabled() || !["NFO", "BFO"].includes(position.exch)) {
         store.finish(tsym, "failed", `${note}: trading disabled or unsupported exchange`);
         return noStore(res).json({ handled: true, status: "failed" });
+      }
+      if (!store.canSubmit(tsym, claimedRev)) {
+        return noStore(res).json({ handled: false, status: "reconciliation_required" });
       }
       await submitExit(session, position, ltp);
       console.log(`Risk exit submitted for ${tsym}`);
       store.finish(tsym, "done", `${note}: exit order submitted`);
       noStore(res).json({ handled: true, status: "done" });
     } catch (error) {
-      // The order may or may not have reached the broker, so it is never retried automatically.
       console.error("Risk exit failed", { tsym, code: error.code, status: error.response?.status });
-      store.finish(tsym, "failed", `${note}: exit failed or uncertain; verify with Flattrade`);
-      noStore(res).json({ handled: true, status: "failed" });
+      try {
+        store.markReconciliationRequired("", tsym, claimedRev,
+          error.message.startsWith("Position needs reconciliation:") ? error.message :
+            error.code === "ECONNABORTED" || error.code === "ETIMEDOUT"
+              ? "Position needs reconciliation: broker request timed out or exit is uncertain"
+              : "Position needs reconciliation: broker request failed or exit is uncertain");
+        noStore(res).json({ handled: true, status: "reconciliation_required" });
+      } catch (markError) {
+        console.error("Unable to persist reconciliation status", { tsym, code: markError.code });
+        res.status(503).json({ message: "Unable to record exit uncertainty; verify with Flattrade" });
+      }
     }
-  });
+  };
+  router.post("/internal/trigger", internal, trigger("server"));
+  router.post("/trigger", trigger("ui"));
 
   return router;
 };

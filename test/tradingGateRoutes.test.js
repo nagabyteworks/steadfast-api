@@ -50,6 +50,21 @@ function dispatch(router, method, url, query = {}, headers = {}, body = { noreno
   });
 }
 
+test("position and trade-book refresh failures suspend active risk rules", async (t) => {
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  const reasons = [];
+  const riskStore = { suspendAll: (_account, reason) => reasons.push(reason) };
+  const router = flattradeRoutes(credentials, internalToken, async () => {}, undefined,
+    null, "production", true, riskStore);
+  axios.post = async () => { throw Object.assign(new Error("timeout"), { code: "ECONNABORTED" }); };
+  assert.equal((await dispatch(router, "GET", "/positions")).status, 502);
+  assert.match(reasons[0], /timed out/);
+  axios.post = async (url) => ({ data: url.endsWith("/TradeBook") ? [] : [{ tsym: "TEST" }] });
+  assert.equal((await dispatch(router, "GET", "/getOrdersAndTrades")).status, 200);
+  assert.match(reasons[1], /trade book.*empty/);
+});
+
 test("production uses a server-managed Flattrade session and blocks browser credentials and trading", async (t) => {
   const originalEnv = { ...process.env };
   const originalPost = axios.post;

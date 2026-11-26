@@ -74,6 +74,11 @@ module.exports = (
   const restrictedTrading = production || serverManagedAccount;
   let loginInProgress = false;
   const getStoredSession = () => sessionStore ? sessionStore.get() : storedCredentials.flattrade;
+  const suspendRisk = (reason) => {
+    if (riskStore && serverManagedAccount) {
+      riskStore.suspendAll(process.env.FLATTRADE_CLIENT_ID || "", `Position needs reconciliation: ${reason}`);
+    }
+  };
 
   const getSession = (req) => serverManagedAccount
     ? getStoredSession()
@@ -294,6 +299,7 @@ module.exports = (
   router.get("/positions", async (req, res) => {
     const { usersession, userid } = getSession(req);
     if (!usersession || !userid) {
+      suspendRisk("Flattrade session is unavailable");
       return res.status(401).json({ message: "Flattrade session is unavailable" });
     }
     try {
@@ -303,9 +309,12 @@ module.exports = (
         payload,
         { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
       );
+      if (!Array.isArray(response.data) || response.data.length === 0) suspendRisk("broker position book is unavailable or empty");
       res.json(response.data);
     } catch (error) {
       console.error("Error fetching Flattrade positions", { code: error.code, status: error.response?.status });
+      suspendRisk(error.code === "ECONNABORTED" || error.code === "ETIMEDOUT"
+        ? "broker position request timed out" : "broker position request failed");
       res.status(502).json({ message: "Error fetching Flattrade positions" });
     }
   });
@@ -400,6 +409,7 @@ module.exports = (
     const { usersession: jKey, userid: clientId } = getSession(req);
 
     if (!jKey || !clientId) {
+      suspendRisk("Flattrade session is unavailable");
       return res
         .status(400)
         .json({ message: "Token or Client ID is missing." });
@@ -438,6 +448,7 @@ module.exports = (
           },
         }
       );
+      if (!Array.isArray(tradeBookRes.data) || tradeBookRes.data.length === 0) suspendRisk("broker trade book is unavailable or empty");
 
       res.json({
         orderBook: orderBookRes.data,
@@ -445,6 +456,8 @@ module.exports = (
       });
     } catch (error) {
       console.error("Error fetching Flattrade orders and trades", { code: error.code, status: error.response?.status });
+      suspendRisk(error.code === "ECONNABORTED" || error.code === "ETIMEDOUT"
+        ? "broker history request timed out" : "broker history request failed");
       res.status(502).json({ message: "Error fetching Flattrade orders and trades" });
     }
   });

@@ -41,12 +41,17 @@ const stateDirectory = process.env.STATE_DIRECTORY ||
 if (config.serverManagedAccount) fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
 const sessionStore = config.serverManagedAccount
   ? createSessionStore(stateDirectory, process.env.FLATTRADE_CLIENT_ID, async () => {
+      if (riskStore) riskStore.suspendAll(process.env.FLATTRADE_CLIENT_ID || "",
+        "Position needs reconciliation: Flattrade session expired");
       await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
     })
   : null;
 
 const riskStore = config.serverManagedAccount ? createRiskStore(stateDirectory) : null;
-if (riskStore) console.log("Server-side stop-loss/target: LIVE");
+if (riskStore) {
+  riskStore.suspendOnStartup(process.env.FLATTRADE_CLIENT_ID || "");
+  console.log("Server-side stop-loss/target: LIVE");
+}
 
 // Restore the persisted Flattrade token so a restart does not require a new login.
 function restoreStoredSession() {

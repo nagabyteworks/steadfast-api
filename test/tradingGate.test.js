@@ -4,12 +4,14 @@ const express = require("express");
 const axios = require("axios");
 const flattradeRoutes = require("../routes/flattrade");
 const shoonyaRoutes = require("../routes/shoonya");
+const virtualRoutes = require("../routes/virtual");
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use("/flattrade", flattradeRoutes({}));
 app.use("/shoonya", shoonyaRoutes({}));
+app.use("/virtual", virtualRoutes());
 
 let server;
 let baseUrl;
@@ -99,4 +101,17 @@ test("enabled Flattrade routes require server credentials while Shoonya uses the
   }
 
   assert.equal(calls.length, 2);
+});
+
+test("virtual trading is unavailable regardless of the live trading switch", async () => {
+  for (const enabled of ["false", "true"]) {
+    process.env.TRADING_ENABLED = enabled;
+    for (const endpoint of ["/virtual/placeOrder", "/virtual/cancelOrder", "/virtual/getOrdersAndTrades"]) {
+      const response = await fetch(`${baseUrl}${endpoint}`, {
+        method: endpoint.endsWith("getOrdersAndTrades") ? "GET" : "POST",
+      });
+      assert.equal(response.status, 403);
+      assert.match((await response.json()).message, /unavailable/i);
+    }
+  }
 });

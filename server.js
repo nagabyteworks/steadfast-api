@@ -46,7 +46,7 @@ const sessionStore = config.serverManagedAccount
   : null;
 
 const riskStore = config.serverManagedAccount ? createRiskStore(stateDirectory) : null;
-if (riskStore) console.log(`Server-side stop-loss/target: ${config.dryRun ? "DRY RUN (no exit orders)" : "LIVE"}`);
+if (riskStore) console.log("Server-side stop-loss/target: LIVE");
 
 // Restore the persisted Flattrade token so a restart does not require a new login.
 function restoreStoredSession() {
@@ -74,7 +74,7 @@ app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, a
   if (config.serverManagedAccount || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore, config.dryRun));
+}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore));
 if (config.serverManagedAccount) {
   app.use("/shoonya", (req, res) => {
     res.status(503).json({ message: "Shoonya is unavailable in server-managed mode" });

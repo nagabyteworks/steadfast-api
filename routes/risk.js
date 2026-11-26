@@ -46,17 +46,18 @@ async function submitExit(session, position, ltp) {
   return order;
 }
 
-module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = () => process.env.TRADING_ENABLED === "true" }) => {
+module.exports = ({ store, getSession, internalToken, tradingEnabled = () => process.env.TRADING_ENABLED === "true" }) => {
   const router = express.Router();
   const internal = requireInternalToken(internalToken);
   const noStore = (res) => res.set("Cache-Control", "no-store");
 
-  router.get("/rules", (req, res) => noStore(res).json({ dryRun, rules: store.list() }));
+  router.get("/rules", (req, res) => noStore(res).json({ rules: store.list() }));
 
   router.put("/rules/:tsym", (req, res) => {
     try {
       const rule = validateRule(req.params.tsym, req.body);
       const rev = store.save(rule);
+      console.log(`Risk rule saved: ${rule.tsym} monitor=${rule.monitor} mode=${rule.mode} sl=${rule.slPrice} target=${rule.targetPrice} trail=${rule.trailPoints} rev=${rev}`);
       noStore(res).json({ ...rule, status: "armed", rev });
     } catch (error) {
       res.status(error.status || 500).json({ message: error.status ? error.message : "Unable to save the rule" });
@@ -71,7 +72,7 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
       if (!existing || existing.status !== "armed") return res.status(404).json({ message: "No armed rule for this position" });
       const patch = req.body || {};
       const merged = { ...existing };
-      for (const field of ["mode", "slPrice", "slPoints", "targetPrice", "trailPoints"]) {
+      for (const field of ["monitor", "mode", "slPrice", "slPoints", "targetPrice", "trailPoints"]) {
         if (field in patch) merged[field] = patch[field];
       }
       const shift = (value, delta) => value === null || !Number.isFinite(Number(delta)) ? value : Number((value + Number(delta)).toFixed(2));
@@ -79,6 +80,7 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
       if ("targetDelta" in patch) merged.targetPrice = shift(merged.targetPrice, patch.targetDelta);
       const rule = validateRule(req.params.tsym, merged);
       const rev = store.save(rule);
+      console.log(`Risk rule saved: ${rule.tsym} monitor=${rule.monitor} mode=${rule.mode} sl=${rule.slPrice} target=${rule.targetPrice} trail=${rule.trailPoints} rev=${rev}`);
       noStore(res).json({ ...rule, status: "armed", rev });
     } catch (error) {
       res.status(error.status || 500).json({ message: error.status ? error.message : "Unable to update the rule" });
@@ -86,20 +88,24 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
   });
 
   router.delete("/rules/:tsym", (req, res) => {
-    store.remove(req.params.tsym);
+    const removed = store.remove(req.params.tsym);
+    console.log(`Risk rule removed: ${req.params.tsym} (existed=${removed})`);
     noStore(res).json({ removed: true });
   });
 
   // ===> Internal endpoints used by the WebSocket service
+  // Rules monitored by the browser (monitor = "ui") are never handed to the WebSocket service.
   router.get("/internal/rules", internal, (req, res) =>
-    noStore(res).json({ rules: store.list().filter((rule) => rule.status === "armed") }));
+    noStore(res).json({ rules: store.list().filter((rule) => rule.status === "armed" && rule.monitor === "server") }));
 
   router.post("/internal/progress", internal, (req, res) => {
     const { tsym, rev, slPrice, targetPrice } = req.body || {};
     const valid = typeof tsym === "string" && Number.isSafeInteger(rev) && Number.isFinite(slPrice) &&
       (targetPrice === null || Number.isFinite(targetPrice));
     if (!valid) return res.status(400).json({ message: "Invalid progress update" });
-    noStore(res).json({ applied: store.updateProgress(tsym, rev, slPrice, targetPrice) });
+    const applied = store.updateProgress(tsym, rev, slPrice, targetPrice);
+    console.log(`Risk trailing progress for ${tsym}: sl=${slPrice} target=${targetPrice} rev=${rev} applied=${applied}`);
+    noStore(res).json({ applied });
   });
 
   router.post("/internal/trigger", internal, async (req, res) => {
@@ -107,9 +113,17 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
     if (typeof tsym !== "string" || typeof reason !== "string") {
       return res.status(400).json({ message: "Invalid trigger" });
     }
-    if (!store.claim(tsym)) return noStore(res).json({ handled: false });
+    if (store.get(tsym)?.monitor === "ui") {
+      console.log(`Risk trigger for ${tsym} ignored: the rule is monitored by the app`);
+      return noStore(res).json({ handled: false });
+    }
+    if (!store.claim(tsym)) {
+      console.log(`Risk trigger for ${tsym} ignored: rule is not armed (already handled or removed)`);
+      return noStore(res).json({ handled: false });
+    }
 
     const note = `${reason.slice(0, 40)} at ${Number(ltp)}`;
+    console.log(`Risk trigger received for ${tsym}: ${note}`);
     try {
       const session = getSession();
       if (!session.usersession) {
@@ -122,11 +136,6 @@ module.exports = ({ store, getSession, internalToken, dryRun, tradingEnabled = (
         return noStore(res).json({ handled: true, status: "cancelled" });
       }
       const side = Number(position.netqty) > 0 ? "SELL" : "BUY";
-      if (dryRun) {
-        console.log(`DRY RUN: would ${side} ${Math.abs(Number(position.netqty))} ${tsym} (${note})`);
-        store.finish(tsym, "dry_run", `${note}: dry run, no order sent`);
-        return noStore(res).json({ handled: true, status: "dry_run" });
-      }
       if (!tradingEnabled() || !["NFO", "BFO"].includes(position.exch)) {
         store.finish(tsym, "failed", `${note}: trading disabled or unsupported exchange`);
         return noStore(res).json({ handled: true, status: "failed" });

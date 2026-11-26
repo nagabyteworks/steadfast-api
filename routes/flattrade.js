@@ -67,8 +67,7 @@ module.exports = (
     process.env.FLATTRADE_API_KEY &&
     process.env.FLATTRADE_API_SECRET
   ),
-  riskStore = null,
-  dryRun = true
+  riskStore = null
 ) => {
   const router = express.Router();
   const production = environment === "production";
@@ -84,7 +83,7 @@ module.exports = (
       };
 
   if (riskStore && serverManagedAccount) {
-    router.use("/risk", createRiskRouter({ store: riskStore, getSession: getStoredSession, internalToken, dryRun }));
+    router.use("/risk", createRiskRouter({ store: riskStore, getSession: getStoredSession, internalToken }));
   }
 
   const configuredAccount = () => ({

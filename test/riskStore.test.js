@@ -26,8 +26,8 @@ test("a rule can be claimed once and progress is ignored after a user edit", (t)
   assert.equal(store.claim("NIFTYCE"), true);
   assert.equal(store.claim("NIFTYCE"), false);
   assert.equal(store.updateProgress("NIFTYCE", edited, 100, 130), false);
-  assert.equal(store.finish("NIFTYCE", "dry_run", "ok"), true);
-  assert.equal(store.list()[0].status, "dry_run");
+  assert.equal(store.finish("NIFTYCE", "done", "ok"), true);
+  assert.equal(store.list()[0].status, "done");
 });
 
 test("invalid rules are rejected", () => {
@@ -55,4 +55,18 @@ test("exit orders are limit prices through the market because Flattrade rejects 
   assert.equal(marketableLimitPrice(100, false), "102.00");
   assert.equal(marketableLimitPrice(0.05, true), "0.05");
   assert.throws(() => marketableLimitPrice(undefined, true), /live price/);
+});
+
+test("rules default to server monitoring and persist the monitor choice", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-risk-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = createRiskStore(directory);
+  t.after(() => store.close());
+
+  assert.equal(validateRule("X", input()).monitor, "server");
+  assert.throws(() => validateRule("X", input({ monitor: "phone" })), /Invalid monitor/);
+  store.save(validateRule("UI1", input({ monitor: "ui" })));
+  store.save(validateRule("SRV1", input()));
+  const monitors = Object.fromEntries(store.list().map((rule) => [rule.tsym, rule.monitor]));
+  assert.deepEqual(monitors, { SRV1: "server", UI1: "ui" });
 });

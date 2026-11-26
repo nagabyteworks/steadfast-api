@@ -76,8 +76,6 @@ module.exports = {
   environment,
   serverManagedAccount: environment === "production" || hasFlattradeCredentials,
   internalToken,
-  // Risk exits only log what they would do unless DRY_RUN=false is set explicitly.
-  dryRun: process.env.DRY_RUN !== "false",
   port: readPort("PORT", 3000),
   host,
   brokerPorts: {

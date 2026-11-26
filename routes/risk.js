@@ -3,6 +3,7 @@ const axios = require("axios");
 const requireInternalToken = require("../middleware/requireInternalToken");
 const { validateRule } = require("../riskStore");
 const { reconstructOpeningFill } = require("../positionLifecycle");
+const { asBook, getOrderState } = require("../reconciliationService");
 
 const BROKER = "https://piconnect.flattrade.in/PiConnectAPI";
 const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
@@ -71,7 +72,8 @@ async function submitExit(session, position, ltp) {
   return data.norenordno;
 }
 
-module.exports = ({ store, getSession, internalToken, tradingEnabled = () => process.env.TRADING_ENABLED === "true",
+module.exports = ({ store, getSession, internalToken, reconciliationService = null,
+  tradingEnabled = () => process.env.TRADING_ENABLED === "true",
   tradingDay = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date()) }) => {
   const router = express.Router();
   const internal = requireInternalToken(internalToken);
@@ -83,7 +85,11 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
       if (!session?.usersession || !session.userid) {
         store.suspendAll(session?.userid || "", "Position needs reconciliation: Flattrade session is unavailable");
       }
-      return noStore(res).json({ rules: store.list(), reconciliation: store.listReconciliation(session?.userid || null) });
+      return noStore(res).json({
+        rules: store.list(),
+        reconciliation: store.listReconciliation(session?.userid || null),
+        reconciliationStatus: reconciliationService?.getStatus() ?? null,
+      });
     } catch (error) {
       console.error("Unable to load risk rules", { code: error.code });
       try {
@@ -119,10 +125,12 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
         store.markReconciliationRequired(account, req.params.tsym, expectedRev, reason);
       } catch (error) {
         console.error("Unable to persist reconciliation status", { tsym: req.params.tsym, code: error.code });
-        return res.status(503).json({ message: "Unable to persist reconciliation status; verify protection manually" });
+        return res.status(503).json({ message: "ACTION REQUIRED" });
       }
-      return res.status(status).json({ status: "RECONCILIATION_REQUIRED",
-        message: `${reason}; previous protection is suspended if present; verify the position and protection with Flattrade` });
+      return res.status(status).json({
+        status: "RECONCILIATION_REQUIRED",
+        message: "OPEN – RECOVERING",
+      });
     };
     let session;
     try {
@@ -211,6 +219,11 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
     console.log(`Risk trailing progress for ${tsym}: sl=${slPrice} target=${targetPrice} rev=${rev} applied=${applied}`);
     noStore(res).json({ applied });
   });
+  router.post("/internal/reconcile", internal, (req, res) => {
+    if (!reconciliationService) return res.status(503).json({ message: "Reconciliation service is unavailable" });
+    void reconciliationService.requestNow("websocket_reconnect");
+    return noStore(res).status(202).json({ accepted: true });
+  });
 
   const trigger = (monitor) => async (req, res) => {
     const { tsym, reason, ltp, rev } = req.body || {};
@@ -257,17 +270,45 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
       if (!store.canSubmit(tsym, claimedRev)) {
         return noStore(res).json({ handled: false, status: "reconciliation_required" });
       }
+      const orderPayload = `jData=${JSON.stringify({ uid: session.userid, prd: position.prd })}&jKey=${session.usersession}`;
+      const orderResponse = await axios.post(`${BROKER}/OrderBook`, orderPayload,
+        { headers: FORM, timeout: 10000 });
+      const activeOrders = asBook(orderResponse.data, "OrderBook").filter((order) =>
+        order?.tsym === position.tsym && order?.exch === position.exch && order?.prd === position.prd &&
+        getOrderState(order) !== "final");
+      if (activeOrders.length) {
+        const order = activeOrders[0];
+        const isExitSide = order.trantype === (Number(position.netqty) > 0 ? "S" : "B");
+        if (activeOrders.length === 1 && isExitSide && getOrderState(order) === "active" &&
+            typeof order.norenordno === "string" && order.norenordno) {
+          const message = `An active Flattrade exit order ${order.norenordno} was found; awaiting reconciliation`;
+          if (!store.adoptActiveExitOrder(session.userid, tsym, claimedRev, order.norenordno, message)) {
+            store.recordExitOrder(session.userid, tsym, order.norenordno);
+            store.markReconciliationRequired(session.userid, tsym, claimedRev,
+              `Position needs reconciliation: ${message}`);
+          }
+          if (reconciliationService) void reconciliationService.requestNow("exit_order_discovered");
+          return noStore(res).json({ handled: true, status: "exit_pending", brokerOrderId: order.norenordno });
+        }
+        throw new Error("Position needs reconciliation: a conflicting or unrecognized broker order is active");
+      }
+      if (!store.canSubmit(tsym, claimedRev)) {
+        return noStore(res).json({ handled: false, status: "reconciliation_required" });
+      }
       const brokerOrderId = await submitExit(session, position, ltp);
       console.log(`Risk exit accepted for ${tsym}; awaiting fill confirmation`);
-      if (!store.finish(tsym, "exit_pending",
-        `${note}: Flattrade accepted exit order ${brokerOrderId}; execution is unconfirmed`)) {
+      const exitMessage = `${note}: Flattrade accepted exit order ${brokerOrderId}; execution is unconfirmed`;
+      if (!store.finishExit(session.userid, tsym, claimedRev, brokerOrderId, exitMessage)) {
+        store.recordExitOrder(session.userid, tsym, brokerOrderId);
         const message = `Position needs reconciliation: Flattrade accepted exit order ${brokerOrderId}, but exit state changed before it could be recorded`;
         store.markReconciliationRequired(session.userid, tsym, claimedRev, message);
         noStore(res).json({ handled: true, status: "reconciliation_required", brokerOrderId });
         return;
       }
+      if (reconciliationService) void reconciliationService.requestNow("exit_submitted");
       noStore(res).json({ handled: true, status: "exit_pending", brokerOrderId });
     } catch (error) {
+      if (reconciliationService) void reconciliationService.requestNow("exit_status_uncertain");
       console.error("Risk exit failed", { tsym, code: error.code, status: error.response?.status });
       try {
         store.markReconciliationRequired("", tsym, claimedRev,
@@ -278,7 +319,7 @@ module.exports = ({ store, getSession, internalToken, tradingEnabled = () => pro
         noStore(res).json({ handled: true, status: "reconciliation_required" });
       } catch (markError) {
         console.error("Unable to persist reconciliation status", { tsym, code: markError.code });
-        res.status(503).json({ message: "Unable to record exit uncertainty; verify with Flattrade" });
+        res.status(503).json({ message: "ACTION REQUIRED" });
       }
     }
   };

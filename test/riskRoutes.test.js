@@ -189,7 +189,7 @@ test("manual protection uses reconciled fills and discards a stale lifecycle", a
   response = await dispatch(router, "POST", "/rules/NIFTYCE/manual", stop);
   assert.equal(response.status, 409);
   assert.equal(response.body.status, "RECONCILIATION_REQUIRED");
-  assert.match(response.body.message, /previous protection is suspended/);
+  assert.equal(response.body.message, "OPEN – RECOVERING");
   assert.equal(store.get("NIFTYCE").status, "reconciliation_required");
   assert.deepEqual([store.get("NIFTYCE").slPrice, store.get("NIFTYCE").targetPrice], [140, 170]);
 });
@@ -231,7 +231,7 @@ test("unidentified carry-forward is flagged and the stale rule stays suspended a
   response = await dispatch(router(), "POST", "/rules/NIFTYCE/default", config);
   assert.equal(response.status, 409);
   assert.equal(response.body.status, "RECONCILIATION_REQUIRED");
-  assert.match(response.body.message, /Manual reconciliation/);
+  assert.equal(response.body.message, "ACTION REQUIRED: automatic recovery cannot verify this position lifecycle");
   const manual = { ...config, kind: "stop" };
   response = await dispatch(router(), "POST", "/rules/NIFTYCE/manual", manual);
   assert.equal(response.status, 409);
@@ -252,6 +252,23 @@ test("internal progress is authenticated and cannot overwrite a newer revision",
   assert.equal(store.get("NIFTYCE").slPrice, 155);
 });
 
+test("reconciliation status is exposed and only an authenticated reconnect can trigger an immediate cycle", async (t) => {
+  const requests = [];
+  const reconciliationService = {
+    getStatus: () => ({ running: true, currentStatus: "success", activePositionCount: 2 }),
+    requestNow: (reason) => requests.push(reason),
+  };
+  const { router } = setup(t, { reconciliationService });
+  const denied = await dispatch(router, "POST", "/internal/reconcile");
+  assert.equal(denied.status, 403);
+  const accepted = await dispatch(router, "POST", "/internal/reconcile", {}, internal);
+  assert.equal(accepted.status, 202);
+  assert.deepEqual(accepted.body, { accepted: true });
+  assert.deepEqual(requests, ["websocket_reconnect"]);
+  assert.deepEqual((await dispatch(router, "GET", "/rules")).body.reconciliationStatus,
+    { running: true, currentStatus: "success", activePositionCount: 2 });
+});
+
 test("a server trigger sends one exit for the open quantity and never retries", async (t) => {
   const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
   seed(store);
@@ -262,16 +279,41 @@ test("a server trigger sends one exit for the open quantity and never retries", 
     calls.push({ url, body });
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     return { data: { stat: "Ok", norenordno: "exit-1" } };
   };
   const trigger = { tsym: "NIFTYCE", reason: "Stop-loss", ltp: 140, rev: 1 };
   assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.status, "exit_pending");
   assert.equal(store.get("NIFTYCE").status, "exit_pending");
+  assert.equal(store.getExitOrderId("test", "NIFTYCE"), "exit-1");
   assert.match(store.get("NIFTYCE").message, /exit-1.*execution is unconfirmed/);
-  assert.match(calls[3].body, /"trantype":"S"/);
-  assert.match(calls[3].body, /"qty":"75"/);
+  assert.match(calls[4].body, /"trantype":"S"/);
+  assert.match(calls[4].body, /"qty":"75"/);
   assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.handled, false);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 5);
+});
+
+test("a trigger adopts an existing broker exit order instead of submitting another", async (t) => {
+  const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
+  seed(store);
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  const calls = [];
+  axios.post = async (url) => {
+    calls.push(url);
+    if (url.endsWith("/PositionBook")) return { data: [livePosition] };
+    if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [{
+      norenordno: "manual-exit", tsym: "NIFTYCE", exch: "NFO", prd: "M",
+      trantype: "S", status: "OPEN", qty: "75", fillshares: "0",
+    }] };
+    throw new Error("A duplicate exit order must not be sent");
+  };
+  const result = await dispatch(router, "POST", "/internal/trigger",
+    { tsym: "NIFTYCE", reason: "Stop-loss", ltp: 140, rev: 1 }, internal);
+  assert.deepEqual(result.body, { handled: true, status: "exit_pending", brokerOrderId: "manual-exit" });
+  assert.equal(store.getExitOrderId("test", "NIFTYCE"), "manual-exit");
+  assert.equal(calls.some((url) => url.endsWith("/PlaceOrder")), false);
 });
 
 test("a trigger for a flat position requires reconciliation", async (t) => {
@@ -295,11 +337,12 @@ test("a rejected exit requires reconciliation and is not retried", async (t) => 
     calls++;
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     return { data: { stat: "Not_Ok" } };
   };
   assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.status, "reconciliation_required");
   assert.equal((await dispatch(router, "POST", "/internal/trigger", trigger, internal)).body.handled, false);
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("an accepted exit without a broker order ID is uncertain, not complete", async (t) => {
@@ -310,6 +353,7 @@ test("an accepted exit without a broker order ID is uncertain, not complete", as
   axios.post = async (url) => {
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     return { data: { stat: "Ok" } };
   };
   const result = await dispatch(router, "POST", "/internal/trigger",
@@ -326,6 +370,7 @@ test("an accepted exit is flagged when its lifecycle changes during submission",
   axios.post = async (url) => {
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     store.markReconciliationRequired("test", "NIFTYCE", 1, "Position needs reconciliation: changed");
     return { data: { stat: "Ok", norenordno: "exit-race" } };
   };
@@ -345,6 +390,7 @@ test("UI-monitored triggers use the API-owned broker exit flow", async (t) => {
     calls.push(url);
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     return { data: { stat: "Ok", norenordno: "ui-exit" } };
   };
   const result = await dispatch(router, "POST", "/trigger",
@@ -365,6 +411,7 @@ test("risk triggers require a finite positive price that crossed the configured 
     calls.push(url);
     if (url.endsWith("/PositionBook")) return { data: [livePosition] };
     if (url.endsWith("/TradeBook")) return { data: liveTrades };
+    if (url.endsWith("/OrderBook")) return { data: [] };
     return { data: { stat: "Ok", norenordno: "exit-2" } };
   };
   assert.equal((await dispatch(router, "POST", "/internal/trigger",

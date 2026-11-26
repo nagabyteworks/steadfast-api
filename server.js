@@ -13,6 +13,7 @@ const fileUpdates = require('./routes/fileUpdates');
 const requireAllowedOrigin = require("./middleware/requireAllowedOrigin");
 const { createSessionStore } = require("./sessionStore");
 const { createRiskStore } = require("./riskStore");
+const { createReconciliationService } = require("./reconciliationService");
 
 const app = express();
 
@@ -52,6 +53,11 @@ if (riskStore) {
   riskStore.suspendOnStartup(process.env.FLATTRADE_CLIENT_ID || "");
   console.log("Server-side stop-loss/target: LIVE");
 }
+const reconciliationService = riskStore ? createReconciliationService({
+  store: riskStore,
+  getSession: () => sessionStore.get(),
+  account: process.env.FLATTRADE_CLIENT_ID || "",
+}) : null;
 
 // Restore the persisted Flattrade token so a restart does not require a new login.
 function restoreStoredSession() {
@@ -79,7 +85,7 @@ app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, a
   if (config.serverManagedAccount || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore));
+}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore, reconciliationService));
 if (config.serverManagedAccount) {
   app.use("/shoonya", (req, res) => {
     res.status(503).json({ message: "Shoonya is unavailable in server-managed mode" });
@@ -97,6 +103,11 @@ if (config.environment === "production") {
 
 app.get("/", (req, res) => res.send("Welcome to the Steadfast API"));
 app.get("/health", (req, res) => res.status(200).json({ status: "ok" }));
+app.get("/health/reconciliation", (req, res) => res
+  .set("Cache-Control", "no-store")
+  .json(reconciliationService?.getStatus() ?? {
+    enabled: false, running: false, currentStatus: "disabled", unresolvedCount: 0,
+  }));
 
 const BROKER_PORTS = config.brokerPorts;
 
@@ -166,14 +177,37 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "An error occurred on the server" });
 });
 
-app.listen(config.port, config.host, () => {
+const server = app.listen(config.port, config.host, () => {
   console.log(`Server is running on http://${config.host}:${config.port}`);
+  if (reconciliationService) reconciliationService.start();
   if (restoredSession) {
     sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true }).catch((error) => {
       console.error("Unable to restart Flattrade streaming with the restored session:", error.message);
     });
   }
 });
+
+let shutdownPromise;
+const shutdown = (signal) => {
+  if (shutdownPromise) return shutdownPromise;
+  console.log(`Received ${signal}; stopping API services`);
+  shutdownPromise = (async () => {
+    const serverClosed = new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    if (reconciliationService) await reconciliationService.stop();
+    await serverClosed;
+    if (sessionStore) sessionStore.close();
+    if (riskStore) riskStore.close();
+    console.log("API shutdown completed");
+  })().catch((error) => {
+    console.error("API shutdown failed", { code: error.code, name: error.name });
+    process.exitCode = 1;
+  });
+  return shutdownPromise;
+};
+process.once("SIGINT", () => { void shutdown("SIGINT"); });
+process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
 
 // Code To Download Updated Instrument files everyday after 7am IST(1:30am UTC). 
 (async () => {

@@ -78,11 +78,30 @@ function createRiskStore(directory) {
     PRIMARY KEY (account, tsym))`);
   db.exec(`CREATE TABLE IF NOT EXISTS risk_reconciliation (
     account TEXT NOT NULL, tsym TEXT NOT NULL, reason TEXT NOT NULL, updated_at INTEGER NOT NULL,
+    recovery_status TEXT NOT NULL DEFAULT 'RECOVERING',
     PRIMARY KEY (account, tsym))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS risk_exit_order (
+    account TEXT NOT NULL, tsym TEXT NOT NULL, order_id TEXT NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY (account, tsym))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS broker_order_state (
+    account TEXT NOT NULL, order_id TEXT NOT NULL, tsym TEXT NOT NULL, exch TEXT NOT NULL, prd TEXT NOT NULL,
+    side TEXT, quantity INTEGER, filled_quantity INTEGER NOT NULL, remaining_quantity INTEGER,
+    average_fill_price REAL,
+    status TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (account, order_id))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS reconciliation_lease (
+    name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL)`);
 
   // Databases created before the monitor column existed are upgraded in place.
   if (!db.prepare("PRAGMA table_info(risk_rule)").all().some((column) => column.name === "monitor")) {
     db.exec("ALTER TABLE risk_rule ADD COLUMN monitor TEXT NOT NULL DEFAULT 'server'");
+  }
+  if (!db.prepare("PRAGMA table_info(risk_reconciliation)").all()
+    .some((column) => column.name === "recovery_status")) {
+    db.exec("ALTER TABLE risk_reconciliation ADD COLUMN recovery_status TEXT NOT NULL DEFAULT 'RECOVERING'");
+  }
+  if (!db.prepare("PRAGMA table_info(broker_order_state)").all()
+    .some((column) => column.name === "remaining_quantity")) {
+    db.exec("ALTER TABLE broker_order_state ADD COLUMN remaining_quantity INTEGER");
   }
   const selectAll = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE expires_at > ? ORDER BY tsym`);
   const selectOne = db.prepare(`SELECT ${COLUMNS} FROM risk_rule WHERE tsym = ? AND expires_at > ?`);
@@ -99,11 +118,47 @@ function createRiskStore(directory) {
   const saveLifecycle = db.prepare(`INSERT OR REPLACE INTO risk_lifecycle
     (account, tsym, instrument, product, opening_order_id, opening_fill_id, opening_price)
     VALUES (?, ?, ?, ?, ?, ?, ?)`);
-  const flagReconciliation = db.prepare(`INSERT INTO risk_reconciliation (account, tsym, reason, updated_at)
-    VALUES (?, ?, ?, ?) ON CONFLICT(account, tsym) DO UPDATE SET reason = excluded.reason, updated_at = excluded.updated_at`);
+  const flagReconciliation = db.prepare(`INSERT INTO risk_reconciliation (account, tsym, reason, updated_at, recovery_status)
+    VALUES (?, ?, ?, ?, 'RECOVERING') ON CONFLICT(account, tsym) DO UPDATE SET
+    reason = excluded.reason, updated_at = excluded.updated_at, recovery_status = 'RECOVERING'`);
   const clearReconciliation = db.prepare("DELETE FROM risk_reconciliation WHERE account = ? AND tsym = ?");
   const reconciliation = db.prepare("SELECT 1 FROM risk_reconciliation WHERE tsym = ? LIMIT 1");
-  const reconciliationList = db.prepare("SELECT tsym, reason, updated_at FROM risk_reconciliation WHERE account = ? OR account = '' ORDER BY updated_at");
+  const reconciliationOne = db.prepare(`SELECT recovery_status, reason FROM risk_reconciliation
+    WHERE account = ? AND tsym = ?`);
+  const reconciliationList = db.prepare(`SELECT tsym, reason, updated_at, recovery_status FROM risk_reconciliation
+    WHERE account = ? OR account = '' ORDER BY updated_at`);
+  const setRecovery = db.prepare(`UPDATE risk_reconciliation SET recovery_status = ?, reason = ?, updated_at = ?
+    WHERE account = ? AND tsym = ?`);
+  const exitOrder = db.prepare("SELECT order_id FROM risk_exit_order WHERE account = ? AND tsym = ?");
+  const saveExitOrder = db.prepare(`INSERT INTO risk_exit_order (account, tsym, order_id, updated_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(account, tsym) DO UPDATE SET
+    order_id = excluded.order_id, updated_at = excluded.updated_at`);
+  const removeExitOrder = db.prepare("DELETE FROM risk_exit_order WHERE account = ? AND tsym = ?");
+  const recordBrokerOrder = db.prepare(`INSERT INTO broker_order_state
+    (account, order_id, tsym, exch, prd, side, quantity, filled_quantity, remaining_quantity,
+    average_fill_price, status, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account, order_id) DO UPDATE SET tsym = excluded.tsym, exch = excluded.exch,
+    prd = excluded.prd, side = excluded.side, quantity = excluded.quantity,
+    filled_quantity = excluded.filled_quantity, remaining_quantity = excluded.remaining_quantity,
+    average_fill_price = excluded.average_fill_price,
+    status = excluded.status, updated_at = excluded.updated_at
+    WHERE broker_order_state.tsym IS NOT excluded.tsym OR broker_order_state.exch IS NOT excluded.exch OR
+    broker_order_state.prd IS NOT excluded.prd OR broker_order_state.side IS NOT excluded.side OR
+    broker_order_state.quantity IS NOT excluded.quantity OR
+    broker_order_state.filled_quantity IS NOT excluded.filled_quantity OR
+    broker_order_state.remaining_quantity IS NOT excluded.remaining_quantity OR
+    broker_order_state.average_fill_price IS NOT excluded.average_fill_price OR
+    broker_order_state.status IS NOT excluded.status`);
+  const brokerOrder = db.prepare(`SELECT order_id, tsym, exch, prd, side, quantity, filled_quantity,
+    remaining_quantity, average_fill_price, status FROM broker_order_state
+    WHERE account = ? AND order_id = ?`);
+  const lease = db.prepare(`INSERT INTO reconciliation_lease (name, owner, expires_at)
+    VALUES ('broker', ?, ?) ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+    WHERE reconciliation_lease.expires_at <= ? OR reconciliation_lease.owner = ?`);
+  const renewLease = db.prepare(`UPDATE reconciliation_lease SET expires_at = ?
+    WHERE name = 'broker' AND owner = ?`);
+  const releaseLease = db.prepare("DELETE FROM reconciliation_lease WHERE name = 'broker' AND owner = ?");
   const suspendRule = db.prepare(`UPDATE risk_rule SET status = 'reconciliation_required', message = ?, rev = rev + 1,
     updated_at = ? WHERE tsym = ? AND status IN ('armed', 'triggered', 'exit_pending',
       'exit_partially_filled', 'reconciliation_in_progress')`);
@@ -122,7 +177,7 @@ function createRiskStore(directory) {
     list: () => selectAll.all(Date.now()).map(toRule),
     save(rule) {
       if (reconciliation.get(rule.tsym)) {
-        throw Object.assign(new Error("Manual reconciliation is required before protection can be enabled"),
+        throw Object.assign(new Error("ACTION REQUIRED: automatic recovery cannot verify this position lifecycle"),
           { status: 409, code: "RECONCILIATION_REQUIRED" });
       }
       const now = Date.now();
@@ -135,7 +190,7 @@ function createRiskStore(directory) {
       db.exec("BEGIN IMMEDIATE");
       try {
         if (reconciliation.get(rule.tsym)) {
-          throw Object.assign(new Error("Manual reconciliation is required before protection can be enabled"), { status: 409, code: "RECONCILIATION_REQUIRED" });
+          throw Object.assign(new Error("ACTION REQUIRED: automatic recovery cannot verify this position lifecycle"), { status: 409, code: "RECONCILIATION_REQUIRED" });
         }
         const existing = this.get(rule.tsym);
         if ((existing?.rev ?? null) !== expectedRev || existing?.status === "triggered") {
@@ -169,7 +224,7 @@ function createRiskStore(directory) {
       db.exec("BEGIN IMMEDIATE");
       try {
         if (reconciliation.get(rule.tsym)) {
-          throw Object.assign(new Error("Manual reconciliation is required before protection can be enabled"), { status: 409, code: "RECONCILIATION_REQUIRED" });
+          throw Object.assign(new Error("ACTION REQUIRED: automatic recovery cannot verify this position lifecycle"), { status: 409, code: "RECONCILIATION_REQUIRED" });
         }
         const existing = this.get(rule.tsym);
         if ((existing?.rev ?? null) !== expectedRev || existing?.status === "triggered") {
@@ -220,7 +275,7 @@ function createRiskStore(directory) {
       if (current?.status === "triggered") {
         this.markReconciliationRequired("", tsym, current.rev,
           "Position needs reconciliation: an automatic exit is already in progress");
-        throw Object.assign(new Error("An automatic exit is already in progress; verify with Flattrade"), { status: 409 });
+        throw Object.assign(new Error("An automatic exit is already in progress"), { status: 409 });
       }
       begin.run(Date.now(), tsym);
       return this.get(tsym)?.rev ?? null;
@@ -230,7 +285,7 @@ function createRiskStore(directory) {
       try {
         const now = Date.now();
         flagReconciliation.run(account || "", tsym, reason, now);
-        suspendRule.run(`${reason}; previous rule suspended. Verify protection with Flattrade.`, now, tsym);
+        suspendRule.run(`${reason}; previous rule suspended pending automatic recovery.`, now, tsym);
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
@@ -239,17 +294,209 @@ function createRiskStore(directory) {
     },
     listReconciliation(account) {
       const rows = account ? reconciliationList.all(account) : db.prepare(
-        "SELECT tsym, reason, updated_at FROM risk_reconciliation ORDER BY updated_at").all();
+        "SELECT tsym, reason, updated_at, recovery_status FROM risk_reconciliation ORDER BY updated_at").all();
       return rows.map((row) => ({
-        tsym: row.tsym, status: "RECONCILIATION_REQUIRED", message: row.reason, updatedAt: row.updated_at,
+        tsym: row.tsym, status: "RECONCILIATION_REQUIRED", recoveryStatus: row.recovery_status,
+        message: row.reason, updatedAt: row.updated_at,
       }));
+    },
+    getLifecycle(account, tsym) {
+      return lifecycle.get(account, tsym) ?? null;
+    },
+    getExitOrderId(account, tsym) {
+      return exitOrder.get(account || "", tsym)?.order_id ?? null;
+    },
+    recordExitOrder(account, tsym, orderId) {
+      if (typeof orderId !== "string" || !orderId) return false;
+      saveExitOrder.run(account || "", tsym, orderId, Date.now());
+      return true;
+    },
+    recordBrokerOrders(account, orders) {
+      let changed = 0;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const order of orders) {
+          const result = recordBrokerOrder.run(account || "", order.orderId, order.tsym, order.exch, order.prd,
+            order.side, order.quantity, order.filledQuantity, order.remainingQuantity,
+            order.averageFillPrice, order.status, Date.now());
+          changed += result.changes;
+        }
+        db.exec("COMMIT");
+        return changed;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    getBrokerOrder(account, orderId) {
+      return brokerOrder.get(account || "", orderId) ?? null;
+    },
+    finishExit(account, tsym, expectedRev, orderId, message) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const updated = db.prepare(`UPDATE risk_rule SET status = 'exit_pending', message = ?, rev = rev + 1, updated_at = ?
+          WHERE tsym = ? AND rev = ? AND status = 'triggered'`)
+          .run(message, Date.now(), tsym, expectedRev).changes > 0;
+        if (updated && typeof orderId === "string" && orderId) {
+          saveExitOrder.run(account || "", tsym, orderId, Date.now());
+        }
+        db.exec("COMMIT");
+        return updated;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    adoptActiveExitOrder(account, tsym, expectedRev, orderId, message) {
+      if (typeof orderId !== "string" || !orderId) return false;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const updated = db.prepare(`UPDATE risk_rule SET status = 'exit_pending', message = ?, rev = rev + 1, updated_at = ?
+          WHERE tsym = ? AND rev = ? AND status = 'triggered'`)
+          .run(message, Date.now(), tsym, expectedRev).changes > 0;
+        if (updated) saveExitOrder.run(account || "", tsym, orderId, Date.now());
+        db.exec("COMMIT");
+        return updated;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    adoptBrokerExitOrder(account, tsym, expectedRev, orderId, status, message) {
+      if (typeof orderId !== "string" || !orderId ||
+          !["exit_pending", "exit_partially_filled"].includes(status)) return false;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const updated = db.prepare(`UPDATE risk_rule SET status = ?, message = ?, rev = rev + 1, updated_at = ?
+          WHERE tsym = ? AND rev = ? AND status IN
+          ('armed', 'reconciliation_required', 'exit_pending', 'exit_partially_filled')`)
+          .run(status, message, Date.now(), tsym, expectedRev).changes > 0;
+        if (updated) {
+          saveExitOrder.run(account || "", tsym, orderId, Date.now());
+          clearReconciliation.run(account || "", tsym);
+          clearReconciliation.run("", tsym);
+        }
+        db.exec("COMMIT");
+        return updated;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    setRecoveryStatus(account, tsym, status, reason) {
+      if (!["RECOVERING", "ACTION_REQUIRED"].includes(status)) {
+        throw new Error("Invalid reconciliation recovery status");
+      }
+      const current = reconciliationOne.get(account || "", tsym);
+      if (!current || (current.recovery_status === status && current.reason === reason)) return false;
+      return setRecovery.run(status, reason, Date.now(), account || "", tsym).changes > 0;
+    },
+    flagUnprotectedPosition(account, tsym, reason) {
+      const current = reconciliationOne.get(account || "", tsym);
+      if (current?.recovery_status === "ACTION_REQUIRED" && current.reason === reason) return false;
+      flagReconciliation.run(account || "", tsym, reason, Date.now());
+      return this.setRecoveryStatus(account || "", tsym, "ACTION_REQUIRED", reason);
+    },
+    restoreReconciledRule(account, tsym, expectedRev, position, opening) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const current = this.get(tsym);
+        const previous = lifecycle.get(account, tsym);
+        if (!current || current.rev !== expectedRev ||
+            !["reconciliation_required", "exit_pending", "exit_partially_filled"].includes(current.status) ||
+            !sameOpening(previous, position.prd, opening, current) ||
+            current.side !== opening.side || current.entry !== opening.openingPrice) {
+          db.exec("ROLLBACK");
+          return false;
+        }
+        const updated = db.prepare(`UPDATE risk_rule SET status = 'armed', message = NULL, rev = rev + 1, updated_at = ?
+          WHERE tsym = ? AND rev = ? AND status IN
+          ('reconciliation_required', 'exit_pending', 'exit_partially_filled')`)
+          .run(Date.now(), tsym, expectedRev).changes > 0;
+        if (!updated) {
+          db.exec("ROLLBACK");
+          return false;
+        }
+        clearReconciliation.run(account || "", tsym);
+        clearReconciliation.run("", tsym);
+        removeExitOrder.run(account || "", tsym);
+        removeExitOrder.run("", tsym);
+        db.exec("COMMIT");
+        return true;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    closeReconciledRule(account, tsym, expectedRev) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = db.prepare(`UPDATE risk_rule SET status = 'closed', message = NULL, rev = rev + 1,
+          updated_at = ? WHERE tsym = ? AND rev = ? AND status IN
+          ('armed', 'exit_pending', 'exit_partially_filled', 'reconciliation_required')`)
+          .run(Date.now(), tsym, expectedRev);
+        if (result.changes) {
+          clearReconciliation.run(account || "", tsym);
+          clearReconciliation.run("", tsym);
+          removeExitOrder.run(account || "", tsym);
+          removeExitOrder.run("", tsym);
+        }
+        db.exec("COMMIT");
+        return result.changes > 0;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    confirmExitOrder(account, tsym, expectedRev, status, message) {
+      if (!["exit_pending", "exit_partially_filled"].includes(status)) {
+        throw new Error("Invalid confirmed exit status");
+      }
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const current = this.get(tsym);
+        if (!current || current.rev !== expectedRev ||
+            !["reconciliation_required", "exit_pending", "exit_partially_filled"].includes(current.status)) {
+          db.exec("ROLLBACK");
+          return false;
+        }
+        if (current.status !== status || current.message !== message) {
+          db.prepare("UPDATE risk_rule SET status = ?, message = ?, rev = rev + 1, updated_at = ? WHERE tsym = ? AND rev = ?")
+            .run(status, message, Date.now(), tsym, expectedRev);
+        }
+        clearReconciliation.run(account || "", tsym);
+        clearReconciliation.run("", tsym);
+        if (status === "exit_pending" || status === "exit_partially_filled") {
+          const orderId = this.getExitOrderId(account, tsym);
+          if (orderId) saveExitOrder.run(account || "", tsym, orderId, Date.now());
+        }
+        db.exec("COMMIT");
+        return true;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    claimReconciliationLease(owner, now, leaseMs) {
+      return lease.run(owner, now + leaseMs, now, owner).changes > 0;
+    },
+    renewReconciliationLease(owner, expiresAt) {
+      return renewLease.run(expiresAt, owner).changes > 0;
+    },
+    releaseReconciliationLease(owner) {
+      return releaseLease.run(owner).changes > 0;
+    },
+    clearReconciliationForSymbol(account, tsym) {
+      const own = clearReconciliation.run(account || "", tsym).changes;
+      const shared = account ? clearReconciliation.run("", tsym).changes : 0;
+      return own + shared > 0;
     },
     suspendAll(account, reason) {
       for (const rule of this.list()) {
         if (["armed", "triggered", "exit_pending", "exit_partially_filled",
           "reconciliation_in_progress"].includes(rule.status)) {
-          const pendingExit = ["exit_pending", "exit_partially_filled"].includes(rule.status);
-          const detail = pendingExit && rule.message ? `${reason}; ${rule.message}` : reason;
+          const detail = `${reason}; prior status=${rule.status}` +
+            (rule.message ? `; ${rule.message}` : "");
           this.markReconciliationRequired(account, rule.tsym, rule.rev, detail);
         }
       }

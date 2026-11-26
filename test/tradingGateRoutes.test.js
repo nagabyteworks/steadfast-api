@@ -367,7 +367,7 @@ test("production Flattrade accepts only NFO and BFO orders of 1 to 10 whole lots
 
   axios.post = async () => { throw new Error("network failure"); };
   const uncertain = await dispatch(router, "POST", "/placeOrder", {}, {}, baseOrder);
-  assert.match(uncertain.body.message, /uncertain.*before retrying/i);
+  assert.match(uncertain.body.message, /uncertain.*automatic reconciliation/i);
 });
 
 test("production login persists the session for a recreated router", async (t) => {

@@ -67,7 +67,8 @@ module.exports = (
     process.env.FLATTRADE_API_KEY &&
     process.env.FLATTRADE_API_SECRET
   ),
-  riskStore = null
+  riskStore = null,
+  reconciliationService = null
 ) => {
   const router = express.Router();
   const production = environment === "production";
@@ -88,7 +89,9 @@ module.exports = (
       };
 
   if (riskStore && serverManagedAccount) {
-    router.use("/risk", createRiskRouter({ store: riskStore, getSession: getStoredSession, internalToken }));
+    router.use("/risk", createRiskRouter({
+      store: riskStore, getSession: getStoredSession, internalToken, reconciliationService,
+    }));
   }
 
   const configuredAccount = () => ({
@@ -159,6 +162,7 @@ module.exports = (
         else storedCredentials.flattrade = session;
         try {
           await onSessionUpdated();
+          if (reconciliationService) void reconciliationService.requestNow("session_updated");
         } catch (error) {
           console.error("Unable to restart Flattrade streaming after session exchange:", error.message);
           return res.status(503).json({ message: "Flattrade session created, but the streaming service could not be restarted" });
@@ -581,8 +585,10 @@ module.exports = (
           },
         }
       );
+      if (reconciliationService) void reconciliationService.requestNow("order_submitted");
       res.json(response.data);
     } catch (error) {
+      if (reconciliationService) void reconciliationService.requestNow("order_status_uncertain");
       const brokerResponse = error.response?.data;
       const brokerMessage = brokerResponse?.stat === "Not_Ok" &&
         typeof brokerResponse.emsg === "string" && brokerResponse.emsg.trim()
@@ -593,7 +599,7 @@ module.exports = (
       res.status(502).json({
         message: rejected
           ? `Flattrade rejected the order: ${brokerMessage}`
-          : "Order status is uncertain. Verify orders with Flattrade before retrying.",
+          : "Order status is uncertain; automatic reconciliation is in progress. Do not retry yet.",
       });
     }
   });
@@ -624,8 +630,10 @@ module.exports = (
           },
         }
       );
+      if (reconciliationService) void reconciliationService.requestNow("order_cancelled");
       res.json(response.data);
     } catch (error) {
+      if (reconciliationService) void reconciliationService.requestNow("cancellation_status_uncertain");
       res.status(500).json({
         message: "Error cancelling Flattrade order",
         error: error.message,

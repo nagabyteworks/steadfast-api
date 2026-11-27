@@ -160,6 +160,7 @@ function createReconciliationService({
   store,
   getSession,
   account,
+  lotLedger = null,
   request = axios.post,
   now = Date.now,
   setIntervalFn = setInterval,
@@ -230,6 +231,42 @@ function createReconciliationService({
   const reconcileSnapshot = ({ positions, orders, trades }) => {
     const fills = aggregateFills(trades);
     status.brokerStateUpdates = store.recordBrokerOrders(account || "", summarizeOrders(orders, fills));
+    if (lotLedger) {
+      for (const lot of lotLedger.list(account || "")) {
+        if (!lot.brokerOrderId && lot.executionIntentId &&
+            ["EXIT_PENDING", "EXIT_PARTIALLY_FILLED"].includes(lot.status)) {
+          const exitSide = lot.side === "long" ? "S" : "B";
+          const matches = orders.filter((item) =>
+            item.tsym === lot.symbol && item.exch === lot.exchange &&
+            item.prd === lot.productType && item.trantype === exitSide &&
+            getOrderState(item) !== "final" &&
+            parseInteger(item.qty, "lot exit quantity", { allowMissing: true }) === lot.reservedQuantity);
+          if (matches.length === 1) {
+            lotLedger.recordBrokerExit(account || "", lot.lotId, lot.executionIntentId,
+              matches[0].norenordno, "Reconciliation adopted an existing lot exit order");
+          }
+        }
+        if (!lot.brokerOrderId) continue;
+        const order = orders.find((item) => item.norenordno === lot.brokerOrderId);
+        if (!order) continue;
+        const state = getOrderState(order);
+        const fillQuantity = fills.get(lot.brokerOrderId)?.quantity ?? 0;
+        const fillData = fills.get(lot.brokerOrderId);
+        const averageFillPrice = fillData?.quantity ? fillData.value / fillData.quantity : null;
+        const alreadyExited = lot.quantity - lot.remainingQuantity;
+        const fillDelta = Math.max(0, fillQuantity - alreadyExited);
+        if (fillDelta > 0 && averageFillPrice != null) {
+          const partial = fillDelta < lot.remainingQuantity;
+          lotLedger.updateExitFill(account || "", lot.lotId, fillDelta, averageFillPrice,
+            partial ? "EXIT_PARTIALLY_FILLED" : "EXIT_COMPLETED",
+            `Flattrade execution reconciled: ${fillQuantity} filled at ${averageFillPrice.toFixed(4)}`);
+        } else if (state === "final" &&
+            ["REJECTED", "CANCELED", "CANCELLED"].includes(String(order.status ?? order.ordstatus ?? order.stat).toUpperCase())) {
+          lotLedger.releaseExit(account || "", lot.lotId,
+            `Lot exit ${lot.brokerOrderId} was rejected or cancelled`);
+        }
+      }
+    }
     const orderMismatch = checkOrderBooks(orders, fills);
     const openBySymbol = new Map();
     for (const position of positions) {

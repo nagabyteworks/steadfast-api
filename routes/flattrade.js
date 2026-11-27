@@ -7,7 +7,7 @@ const path = require("path");
 const csv = require("fast-csv");
 const qs = require("qs");
 const { parse, isBefore } = require("date-fns");
-const { createHash } = require("crypto");
+const { createHash, randomUUID } = require("crypto");
 const requireTradingEnabled = require("../middleware/requireTradingEnabled");
 const requireInternalToken = require("../middleware/requireInternalToken");
 const createRiskRouter = require("./risk");
@@ -21,6 +21,8 @@ const serverManagedOrderFields = new Set([
 ]);
 
 const lotSizeFiles = { NFO: "Nfo_Index_Derivatives.csv", BFO: "Bfo_Index_Derivatives.csv" };
+const encodeSymbol = (symbol) => encodeURIComponent(symbol).replace(/%20/g, "+")
+  .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 const readNfoLotSize = (tradingSymbol, exchange = "NFO") => new Promise((resolve, reject) => {
   const filePath = path.join(__dirname, "../symbols", lotSizeFiles[exchange]);
   const source = fs.createReadStream(filePath);
@@ -103,6 +105,92 @@ module.exports = (
         lots: symbol ? lotLedger.listBySymbol(account, symbol) : lotLedger.list(account),
       });
     });
+
+    router.post("/lots/sync", async (req, res) => {
+      try {
+        const session = getStoredSession();
+        if (!session?.usersession || !session.userid) {
+          return res.status(503).json({ message: "Lot reconciliation requires an active Flattrade session" });
+        }
+        const account = process.env.FLATTRADE_CLIENT_ID || session.userid;
+        const payload = `jKey=${session.usersession}&jData=${JSON.stringify({ uid: session.userid, actid: session.userid })}`;
+        const [positionResponse, tradeResponse] = await Promise.all([
+          axios.post("https://piconnect.flattrade.in/PiConnectAPI/PositionBook", payload, { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }),
+          axios.post("https://piconnect.flattrade.in/PiConnectAPI/TradeBook", payload, { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }),
+        ]);
+        const positions = Array.isArray(positionResponse.data) ? positionResponse.data : [];
+        const trades = Array.isArray(tradeResponse.data) ? tradeResponse.data : [];
+        const synced = [];
+        for (const position of positions) {
+          const netQuantity = Number(position.netqty);
+          if (!Number.isSafeInteger(netQuantity) || netQuantity === 0) continue;
+          const relevant = trades.filter((trade) => trade?.tsym === position.tsym &&
+            trade?.exch === position.exch && trade?.prd === position.prd);
+          const entrySide = netQuantity > 0 ? "B" : "S";
+          const entryFills = relevant.filter((trade) => trade.trantype === entrySide);
+          let remainingNet = Math.abs(netQuantity);
+          if (!entryFills.length) {
+            const legacyId = `${position.tsym}:legacy`;
+            const existing = lotLedger.get(account, legacyId);
+            synced.push(lotLedger.save(account, {
+              ...(existing || {}),
+              lotId: legacyId,
+              positionId: `${position.exch}:${position.prd}:${position.tsym}`,
+              symbol: position.tsym,
+              exchange: position.exch,
+              productType: position.prd,
+              side: netQuantity > 0 ? "long" : "short",
+              quantity: remainingNet,
+              remainingQuantity: remainingNet,
+              entryAveragePrice: Number(position.netavgprc) || null,
+              status: "OPEN",
+              legacy: true,
+            }));
+            continue;
+          }
+          const entries = new Map();
+          for (const fill of entryFills) {
+            const key = fill.norenordno || fill.flid;
+            const qty = Number(fill.flqty);
+            const price = Number(fill.flprc);
+            if (!key || !Number.isSafeInteger(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) continue;
+            const entry = entries.get(key) || { orderId: key, quantity: 0, value: 0, timestamp: fill.fltm || null };
+            entry.quantity += qty;
+            entry.value += qty * price;
+            entries.set(key, entry);
+          }
+          let lotNumber = 1;
+          for (const entry of entries.values()) {
+            const quantity = Math.min(entry.quantity, remainingNet);
+            if (quantity <= 0) break;
+            const lotId = `${position.tsym}:${entry.orderId}:${lotNumber}`;
+            const existing = lotLedger.get(account, lotId);
+            synced.push(lotLedger.save(account, {
+              ...(existing || {}),
+              lotId,
+              positionId: `${position.exch}:${position.prd}:${position.tsym}`,
+              symbol: position.tsym,
+              exchange: position.exch,
+              productType: position.prd,
+              side: netQuantity > 0 ? "long" : "short",
+              quantity,
+              remainingQuantity: existing?.remainingQuantity ?? quantity,
+              entryOrderId: entry.orderId,
+              entryAveragePrice: entry.value / entry.quantity,
+              status: existing?.status || "OPEN",
+              legacy: false,
+              entryTimestamp: existing?.entryTimestamp || entry.timestamp,
+            }));
+            remainingNet -= quantity;
+            lotNumber++;
+          }
+        }
+        res.set("Cache-Control", "no-store").json({ lots: synced });
+      } catch (error) {
+        console.error("Lot synchronization failed", { code: error.code });
+        res.status(502).json({ message: "Lot synchronization could not verify broker executions" });
+      }
+    });
     router.put("/lots/:lotId", (req, res) => {
       try {
         const account = serverManagedAccount ? (process.env.FLATTRADE_CLIENT_ID || "") : (req.query.FLATTRADE_CLIENT_ID || "");
@@ -112,6 +200,169 @@ module.exports = (
         res.status(error.status || 400).json({ message: error.message });
       }
     });
+    const lotAccount = () => serverManagedAccount
+      ? (process.env.FLATTRADE_CLIENT_ID || getStoredSession()?.userid || "")
+      : "";
+
+    router.patch("/lots/:lotId/protection", requireTradingEnabled, (req, res) => {
+      try {
+        const account = lotAccount();
+        const existing = lotLedger.get(account, req.params.lotId);
+        if (!existing || existing.remainingQuantity <= 0) {
+          return res.status(404).json({ message: "Active lot not found" });
+        }
+        const patch = {};
+        for (const field of ["stopLoss", "target", "trailingStopLoss", "protectionEnabled",
+          "highestFavourablePrice", "trailingActivationThreshold", "trailingDistance",
+          "trailingStep", "trailingActive"]) {
+          if (field in (req.body || {})) patch[field] = req.body[field];
+        }
+        if ("protectionEnabled" in patch &&
+            typeof patch.protectionEnabled !== "boolean") {
+          return res.status(400).json({ message: "Invalid lot protection state" });
+        }
+        for (const field of ["stopLoss", "target", "trailingStopLoss",
+          "trailingActivationThreshold", "trailingDistance", "trailingStep"]) {
+          if (field in patch && patch[field] !== null &&
+              (!Number.isFinite(Number(patch[field])) || Number(patch[field]) <= 0)) {
+            return res.status(400).json({ message: `Invalid ${field}` });
+          }
+        }
+        const lot = lotLedger.updateProtection(account, req.params.lotId, patch);
+        res.set("Cache-Control", "no-store").json({ lot });
+      } catch (error) {
+        res.status(500).json({ message: "Unable to update lot protection" });
+      }
+    });
+
+    const executeLotExit = async (req, res, lotId, reason, ltp = null) => {
+      const account = lotAccount();
+      const lot = lotLedger.get(account, lotId);
+      if (!lot) return res.status(404).json({ message: "Lot not found" });
+      if (lot.remainingQuantity <= 0) return res.status(409).json({ message: "Lot is already closed", lot });
+      if (!lot.protectionEnabled && reason !== "Manual exit") {
+        return res.status(409).json({ message: "Lot protection is disabled", lot });
+      }
+      if (ltp != null && reason !== "Manual exit") {
+        const price = Number(ltp);
+        if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ message: "Invalid lot trigger price" });
+        if (lot.trailingStopLoss != null && lot.trailingDistance != null && lot.trailingActive) {
+          const candidate = Number((price - sign * Number(lot.trailingDistance)).toFixed(2));
+          if (sign * (candidate - Number(lot.trailingStopLoss)) > 0) {
+            lotLedger.updateProtection(account, lotId, {
+              stopLoss: candidate,
+              highestFavourablePrice: price,
+            });
+          }
+        } else if (lot.trailingDistance != null && lot.trailingActivationThreshold != null &&
+            sign * (price - Number(lot.trailingActivationThreshold)) >= 0) {
+          lotLedger.updateProtection(account, lotId, {
+            trailingActive: true,
+            highestFavourablePrice: price,
+            stopLoss: Number((price - sign * Number(lot.trailingDistance)).toFixed(2)),
+          });
+        }
+        const crossed = reason === "Stop-loss"
+          ? lot.stopLoss != null && sign * (price - Number(lot.stopLoss)) <= 0
+          : lot.target != null && sign * (price - Number(lot.target)) >= 0;
+        if (!crossed) return res.status(409).json({ message: "Lot trigger price has not crossed its protection level" });
+      }
+      if (lot.status === "EXIT_PENDING" || lot.status === "EXIT_PARTIALLY_FILLED" ||
+          lot.status === "EXIT_COMPLETED") {
+        return res.status(409).json({ lot, message: "Lot exit is already in progress or complete" });
+      }
+      let livePrice = Number(ltp);
+      if (!Number.isFinite(livePrice) || livePrice <= 0) {
+        const session = getStoredSession();
+        if (!session?.usersession || !session.userid) {
+          return res.status(503).json({ lot, message: "Lot exit requires an active Flattrade session" });
+        }
+        try {
+          const positionPayload = `jKey=${session.usersession}&jData=${JSON.stringify({ uid: session.userid, actid: session.userid })}`;
+          const positionResponse = await axios.post(
+            "https://piconnect.flattrade.in/PiConnectAPI/PositionBook",
+            positionPayload,
+            { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 },
+          );
+          const position = Array.isArray(positionResponse.data)
+            ? positionResponse.data.find((item) => item?.tsym === lot.symbol &&
+              item?.exch === lot.exchange && item?.prd === lot.productType)
+            : null;
+          livePrice = Number(position?.lp);
+        } catch (error) {
+          return res.status(502).json({ lot, message: "Lot exit requires a live price and broker reconciliation" });
+        }
+      }
+      if (!Number.isFinite(livePrice) || livePrice <= 0) {
+        return res.status(400).json({ lot, message: "A live price is required for the lot exit" });
+      }
+      const intentId = `${lotId}:${randomUUID()}`;
+      const reserved = lotLedger.reserveExit(account, lotId, intentId);
+      if (!reserved.reserved) return res.status(409).json({ lot: reserved.lot, message: reserved.reason });
+
+      const session = getStoredSession();
+      if (!session?.usersession || !session.userid) {
+        return res.status(503).json({ lot: reserved.lot, message: "Lot exit reservation is unresolved: Flattrade session unavailable" });
+      }
+      const quantity = reserved.quantity;
+      const selling = lot.side === "long";
+      const exitPrice = Number.isFinite(livePrice) && livePrice > 0
+        ? livePrice
+        : null;
+      if (!exitPrice) {
+        return res.status(400).json({ lot: reserved.lot, message: "A live price is required for the lot exit" });
+      }
+      const ticks = (exitPrice * (selling ? 1 - 0.02 : 1 + 0.02)) / 0.05;
+      const price = Math.max(0.05, (selling ? Math.floor(ticks) : Math.ceil(ticks)) * 0.05).toFixed(2);
+      const order = {
+        uid: session.userid,
+        actid: session.userid,
+        exch: lot.exchange,
+        tsym: encodeSymbol(lot.symbol),
+        qty: String(quantity),
+        prc: price,
+        prd: lot.productType,
+        trantype: selling ? "S" : "B",
+        prctyp: "LMT",
+        ret: "DAY",
+        ordersource: "API",
+      };
+      try {
+        const orderPayload = `jData=${JSON.stringify(order)}&jKey=${session.usersession}`;
+        const response = await axios.post("https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder",
+          orderPayload, { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 });
+        if (response.data?.stat !== "Ok" || typeof response.data.norenordno !== "string" ||
+            !response.data.norenordno) {
+          return res.status(502).json({
+            lot: lotLedger.get(account, lotId),
+            message: "Lot exit was rejected or returned without a broker order ID",
+          });
+        }
+        lotLedger.recordBrokerExit(account, lotId, intentId, response.data.norenordno,
+          `${reason}: Flattrade accepted exit order ${response.data.norenordno}; fill unconfirmed`);
+        if (reconciliationService) void reconciliationService.requestNow("lot_exit_submitted");
+        res.status(202).json({
+          lot: lotLedger.get(account, lotId),
+          brokerOrderId: response.data.norenordno,
+          intentId,
+        });
+      } catch (error) {
+        lotLedger.updateProtection(account, lotId, {
+          protectionState: "RECONCILIATION_REQUIRED",
+        });
+        if (reconciliationService) void reconciliationService.requestNow("lot_exit_uncertain");
+        res.status(502).json({
+          lot: lotLedger.get(account, lotId),
+          message: "Lot exit status is uncertain; automatic reconciliation will resolve the submission",
+        });
+      }
+    };
+
+    router.post("/lots/:lotId/exit", requireTradingEnabled, requireServerManagedTrading,
+      (req, res) => executeLotExit(req, res, req.params.lotId, "Manual exit", req.body?.ltp));
+    router.post("/lots/:lotId/trigger", requireTradingEnabled, requireServerManagedTrading,
+      (req, res) => executeLotExit(req, res, req.params.lotId,
+        req.body?.reason === "Target" ? "Target" : "Stop-loss", req.body?.ltp));
     router.delete("/lots/:lotId", (req, res) => {
       const account = serverManagedAccount ? (process.env.FLATTRADE_CLIENT_ID || "") : (req.query.FLATTRADE_CLIENT_ID || "");
       res.set("Cache-Control", "no-store").json({ removed: lotLedger.remove(account, req.params.lotId) });

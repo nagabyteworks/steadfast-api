@@ -59,6 +59,7 @@ const reconciliationService = riskStore ? createReconciliationService({
   store: riskStore,
   getSession: () => sessionStore.get(),
   account: process.env.FLATTRADE_CLIENT_ID || "",
+  lotLedger,
 }) : null;
 
 // Restore the persisted Flattrade token so a restart does not require a new login.

@@ -164,6 +164,22 @@ test("UI trailing progress rejects stale revisions", async (t) => {
   assert.equal(updated.body.rev, 2);
 });
 
+test("manual protection falls back to the live average or LTP when opening fills are unavailable", async (t) => {
+  const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
+  const originalPost = axios.post;
+  t.after(() => { axios.post = originalPost; });
+  const position = { tsym: "NIFTYCE", exch: "NFO", prd: "M", token: "123", netqty: "75",
+    daybuyqty: "75", daysellqty: "0", cfbuyqty: "0", cfsellqty: "0",
+    netavgprc: "125", lp: "200" };
+  axios.post = async (url) => ({ data: url.endsWith("/TradeBook") ? [] : [position] });
+  const stop = { kind: "stop", stopPoints: 10, targetPoints: null, trailingStop: false,
+    targetTrailing: false, trailPoints: null, monitor: "server" };
+  const response = await dispatch(router, "POST", "/rules/NIFTYCE/manual", stop);
+  assert.equal(response.status, 200);
+  assert.deepEqual([response.body.entry, response.body.slPrice], [125, 115]);
+  assert.equal(store.get("NIFTYCE").status, "armed");
+});
+
 test("manual protection uses reconciled fills and discards a stale lifecycle", async (t) => {
   const { router, store } = setup(t, { tradingDay: () => "2026-11-26" });
   const originalPost = axios.post;

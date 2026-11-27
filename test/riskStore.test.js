@@ -68,6 +68,35 @@ test("lot ledger persists independent allocations and restarts", (t) => {
   assert.equal(lot.entryAveragePrice, 100);
 });
 
+test("lot exit reservation prevents duplicate submissions and partial fills", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-lot-exit-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const ledger = createLotLedger(directory);
+  t.after(() => ledger.close());
+  ledger.save("account", {
+    lotId: "lot-1", positionId: "NFO:M:NIFTYCE", symbol: "NIFTYCE",
+    exchange: "NFO", productType: "M", side: "long", quantity: 75,
+    remainingQuantity: 75, entryOrderId: "order-1", entryAveragePrice: 100,
+  });
+  const first = ledger.reserveExit("account", "lot-1", "intent-1");
+  const duplicate = ledger.reserveExit("account", "lot-1", "intent-2");
+  assert.equal(first.reserved, true);
+  assert.equal(first.quantity, 75);
+  assert.equal(duplicate.reserved, false);
+  ledger.recordBrokerExit("account", "lot-1", "intent-1", "exit-1", "accepted");
+  assert.equal(ledger.updateExitFill("account", "lot-1", 25, 110,
+    "EXIT_PARTIALLY_FILLED", "25 filled"), true);
+  let lot = ledger.get("account", "lot-1");
+  assert.equal(lot.remainingQuantity, 50);
+  assert.equal(lot.realizedPnl, 250);
+  assert.equal(ledger.updateExitFill("account", "lot-1", 50, 120,
+    "EXIT_COMPLETED", "50 filled"), true);
+  lot = ledger.get("account", "lot-1");
+  assert.equal(lot.remainingQuantity, 0);
+  assert.equal(lot.status, "EXIT_COMPLETED");
+  assert.ok(Math.abs(lot.realizedPnl - 1250) < 0.01);
+});
+
 test("exit orders are limit prices through the market because Flattrade rejects MKT", () => {
   assert.equal(marketableLimitPrice(100, true), "98.00");
   assert.equal(marketableLimitPrice(100, false), "102.00");

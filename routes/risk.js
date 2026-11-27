@@ -33,7 +33,33 @@ async function reconcilePosition(session, tsym, tradingDay) {
   if (fields.some((field) => first[field] !== position[field])) {
     throw new Error("Position needs reconciliation: position changed during refresh");
   }
-  const opening = reconstructOpeningFill(position, trades, tradingDay);
+  let opening;
+  try {
+    opening = reconstructOpeningFill(position, trades, tradingDay);
+  } catch (error) {
+    const relevantTradeHistory = trades.filter((trade) =>
+      trade?.tsym === position.tsym && trade?.exch === position.exch &&
+      trade?.prd === position.prd);
+    if (relevantTradeHistory.length !== 0) throw error;
+    const netQuantity = Number(position.netqty);
+    const netAverage = Number(position.netavgprc);
+    const lastPrice = Number(position.lp);
+    const fallbackEntry = Number.isFinite(netAverage) && netAverage > 0
+      ? netAverage
+      : Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : null;
+    if (!Number.isSafeInteger(netQuantity) || netQuantity === 0 || fallbackEntry == null) {
+      throw error;
+    }
+    opening = {
+      status: "open",
+      side: netQuantity > 0 ? "long" : "short",
+      quantity: Math.abs(netQuantity),
+      openingOrderId: "legacy-unavailable",
+      openingFillId: "legacy-unavailable",
+      openingPrice: Number(fallbackEntry.toFixed(4)),
+      legacy: true,
+    };
+  }
   if (opening.status !== "open") throw new Error("Position needs reconciliation: position is flat");
   return { position, opening };
 }
@@ -201,6 +227,13 @@ module.exports = ({ store, getSession, internalToken, reconciliationService = nu
 
   router.delete("/rules/:tsym", (req, res) => {
     const removed = store.remove(req.params.tsym);
+    try {
+      const session = getSession();
+      const account = session?.userid || "";
+      store.clearReconciliationForSymbol(account, req.params.tsym);
+    } catch (error) {
+      store.clearReconciliationForSymbol("", req.params.tsym);
+    }
     console.log(`Risk rule removed: ${req.params.tsym} (existed=${removed})`);
     noStore(res).json({ removed: true });
   });

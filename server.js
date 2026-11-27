@@ -13,6 +13,7 @@ const fileUpdates = require('./routes/fileUpdates');
 const requireAllowedOrigin = require("./middleware/requireAllowedOrigin");
 const { createSessionStore } = require("./sessionStore");
 const { createRiskStore } = require("./riskStore");
+const { createLotLedger } = require("./lotLedger");
 const { createReconciliationService } = require("./reconciliationService");
 
 const app = express();
@@ -49,6 +50,7 @@ const sessionStore = config.serverManagedAccount
   : null;
 
 const riskStore = config.serverManagedAccount ? createRiskStore(stateDirectory) : null;
+const lotLedger = config.serverManagedAccount ? createLotLedger(stateDirectory) : null;
 if (riskStore) {
   riskStore.suspendOnStartup(process.env.FLATTRADE_CLIENT_ID || "");
   console.log("Server-side stop-loss/target: LIVE");
@@ -85,7 +87,7 @@ app.use("/flattrade", flattradeRoutes(storedCredentials, config.internalToken, a
   if (config.serverManagedAccount || selectedBroker === "flattrade") {
     await sendToPythonServer({ action: "set_broker", broker: "flattrade", restart: true });
   }
-}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore, reconciliationService));
+}, undefined, sessionStore, config.environment, config.serverManagedAccount, riskStore, reconciliationService, lotLedger));
 if (config.serverManagedAccount) {
   app.use("/shoonya", (req, res) => {
     res.status(503).json({ message: "Shoonya is unavailable in server-managed mode" });

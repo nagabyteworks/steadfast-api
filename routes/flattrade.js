@@ -68,7 +68,8 @@ module.exports = (
     process.env.FLATTRADE_API_SECRET
   ),
   riskStore = null,
-  reconciliationService = null
+  reconciliationService = null,
+  lotLedger = null
 ) => {
   const router = express.Router();
   const production = environment === "production";
@@ -92,6 +93,29 @@ module.exports = (
     router.use("/risk", createRiskRouter({
       store: riskStore, getSession: getStoredSession, internalToken, reconciliationService,
     }));
+  }
+
+  if (lotLedger) {
+    router.get("/lots", (req, res) => {
+      const account = serverManagedAccount ? (process.env.FLATTRADE_CLIENT_ID || "") : (req.query.FLATTRADE_CLIENT_ID || "");
+      const symbol = typeof req.query.symbol === "string" ? req.query.symbol : null;
+      res.set("Cache-Control", "no-store").json({
+        lots: symbol ? lotLedger.listBySymbol(account, symbol) : lotLedger.list(account),
+      });
+    });
+    router.put("/lots/:lotId", (req, res) => {
+      try {
+        const account = serverManagedAccount ? (process.env.FLATTRADE_CLIENT_ID || "") : (req.query.FLATTRADE_CLIENT_ID || "");
+        const lot = lotLedger.save(account, { ...req.body, lotId: req.params.lotId });
+        res.set("Cache-Control", "no-store").json({ lot });
+      } catch (error) {
+        res.status(error.status || 400).json({ message: error.message });
+      }
+    });
+    router.delete("/lots/:lotId", (req, res) => {
+      const account = serverManagedAccount ? (process.env.FLATTRADE_CLIENT_ID || "") : (req.query.FLATTRADE_CLIENT_ID || "");
+      res.set("Cache-Control", "no-store").json({ removed: lotLedger.remove(account, req.params.lotId) });
+    });
   }
 
   const configuredAccount = () => ({

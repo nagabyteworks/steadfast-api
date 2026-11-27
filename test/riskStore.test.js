@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { createRiskStore, validateRule } = require("../riskStore");
 const { marketableLimitPrice } = require("../routes/risk");
+const { createLotLedger } = require("../lotLedger");
 
 const input = (overrides = {}) => ({
   instrument: "NFO|123", side: "long", entry: 100, mode: "target_trail",
@@ -48,6 +49,23 @@ test("each mode validates its own required fields", () => {
   assert.throws(() => validateRule("X", input({ side: "short", slPrice: 90, targetPrice: 95 })), /./);
   const short = validateRule("X", input({ side: "short", slPrice: 110, targetPrice: 80 }));
   assert.equal(short.side, "short");
+});
+
+test("lot ledger persists independent allocations and restarts", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-lots-test-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let ledger = createLotLedger(directory);
+  ledger.save("account", {
+    lotId: "lot-1", positionId: "NFO:M:NIFTYCE", symbol: "NIFTYCE",
+    exchange: "NFO", productType: "M", side: "long", quantity: 75,
+    remainingQuantity: 75, entryOrderId: "order-1", entryAveragePrice: 100,
+  });
+  ledger.close();
+  ledger = createLotLedger(directory);
+  t.after(() => ledger.close());
+  const lot = ledger.listBySymbol("account", "NIFTYCE")[0];
+  assert.equal(lot.lotId, "lot-1");
+  assert.equal(lot.entryAveragePrice, 100);
 });
 
 test("exit orders are limit prices through the market because Flattrade rejects MKT", () => {

@@ -8,6 +8,8 @@ const axios = require("axios");
 const flattradeRoutes = require("../routes/flattrade");
 const shoonyaRoutes = require("../routes/shoonya");
 const { createSessionStore } = require("../sessionStore");
+const { createRiskStore } = require("../riskStore");
+const { createLotLedger } = require("../lotLedger");
 
 const internalToken = "a".repeat(32);
 const credentials = {
@@ -49,6 +51,32 @@ function dispatch(router, method, url, query = {}, headers = {}, body = { noreno
     });
   });
 }
+
+test("lot routes register with the production stores and retain trading gates", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "steadfast-lot-routes-"));
+  const originalFlag = process.env.TRADING_ENABLED;
+  const riskStore = createRiskStore(directory);
+  const lotLedger = createLotLedger(directory);
+  t.after(() => {
+    if (originalFlag === undefined) delete process.env.TRADING_ENABLED;
+    else process.env.TRADING_ENABLED = originalFlag;
+    riskStore.close();
+    lotLedger.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  process.env.TRADING_ENABLED = "false";
+  const managed = flattradeRoutes(credentials, internalToken, async () => {}, undefined,
+    null, "production", true, riskStore, null, lotLedger);
+  for (const action of ["exit", "trigger"]) {
+    assert.equal((await dispatch(managed, "POST", `/lots/test/${action}`)).status, 403);
+  }
+  process.env.TRADING_ENABLED = "true";
+  const legacy = flattradeRoutes(credentials, internalToken, async () => {}, undefined,
+    null, "development", false, null, null, lotLedger);
+  for (const action of ["exit", "trigger"]) {
+    assert.equal((await dispatch(legacy, "POST", `/lots/test/${action}`)).status, 403);
+  }
+});
 
 test("position and trade-book refresh failures suspend active risk rules", async (t) => {
   const originalPost = axios.post;

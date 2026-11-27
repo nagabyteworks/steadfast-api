@@ -91,6 +91,15 @@ module.exports = (
         userid: req.query.FLATTRADE_CLIENT_ID,
       };
 
+  const requireServerManagedTrading = (req, res, next) => {
+    if (!serverManagedAccount) {
+      return res.status(403).json({
+        message: "Flattrade live trading requires credentials configured in the API environment",
+      });
+    }
+    next();
+  };
+
   if (riskStore && serverManagedAccount) {
     router.use("/risk", createRiskRouter({
       store: riskStore, getSession: getStoredSession, internalToken, reconciliationService,
@@ -374,15 +383,6 @@ module.exports = (
     apiSecret: process.env.FLATTRADE_API_SECRET,
     clientId: process.env.FLATTRADE_CLIENT_ID,
   });
-  const requireServerManagedTrading = (req, res, next) => {
-    if (!serverManagedAccount) {
-      return res.status(403).json({
-        message: "Flattrade live trading requires credentials configured in the API environment",
-      });
-    }
-    next();
-  };
-
   router.use(
     "/flattradeApi",
     (req, res, next) => serverManagedAccount
